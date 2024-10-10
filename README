@@ -1,0 +1,12 @@
+# Automatizing Data Extraction for Replicability Analysis using Z-Curve
+
+This repository contains the code that was used in the project discussed at DGPS 2024, Vienna.
+
+There are three folders, containing the executable RMarkdown files, the rendered html files that might be nicer if you want to read through the files without running the code, and a python folder containing an example file of how to run grobid to convert pdfs to xml.
+
+The files are numbered to indicate the order in which you would use them, where a and b versions are alternatives, that do not need to be both run.
+
+This repository is only meant as a temporary demonstration of the code.
+However, the code will be migrated to another repository in the long term and pointed to from this one.
+The code is currently only meant as a working example, and might still contain errors, and is poorly documented.
+It should, however, already be usable in it's current state.

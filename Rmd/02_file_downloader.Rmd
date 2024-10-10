@@ -1,0 +1,327 @@
+---
+title: "Downloading PDF files from DOIs"
+author: "Julian Quandt"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output: 
+  html_document:
+    theme: cerulean
+    highlight: tango
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    self_contained: true
+    code_folding: show
+    code_download: true
+---
+
+<div style="border: 1px solid #999; border-radius: 5px; padding: 20px; margin-top: 20px; background-color: #ffffe0;">
+  <h3 style="color: #0056b3; margin-top: 0;">The code in this document</h3>
+  In this HTML version of the document, the code chunks that are just doing background work or intermediate steps are hidden to make it more readable. If you want to see the code, you can click on the "Show" buttons on the right hand side of the text. To run the code in R yourself, download the .Rmd file by clicking on the "Code" button on the top right of the document and then selecting "Download Rmd".
+</div>
+
+```{r, include = FALSE}
+# set options to not knit code chunks
+knitr::opts_chunk$set(echo = TRUE, eval = FALSE, include = TRUE, warning = FALSE, message = FALSE)
+if (!require(kableExtra)) {
+  install.packages("kableExtra")
+  library(kableExtra)
+}
+
+#source("secret_vars.R") this needs to be activated and the file created
+```
+
+
+# About
+
+This file can be used to download scientific papers from open access websites. 
+It uses the roadoi package to find open access versions of papers and downloads them.
+If the paper would not be available it is added to a bibtex file for manual download.
+These manual downloads, can be done in Zotero (see below for instructions).
+
+
+## Defining and installing packages
+
+```{r}
+if (!require(httr)) {
+  install.packages("httr")
+  library(httr)
+}
+
+if (!require(xml2)) {
+  install.packages("xml2")
+  library(xml2)
+}
+
+if (!require(stringr)) {
+  install.packages("stringr")
+  library(stringr)
+}
+
+if (!require(roadoi)) {
+  install.packages("roadoi")
+  library(roadoi)
+}
+
+if (!require(bib2df)) {
+  install.packages("bib2df")
+  library(bib2df)
+}
+
+if (!require(httr)) {
+  install.packages("httr")
+  library(httr)
+}
+
+if (!require(googledrive)) {
+  install.packages("googledrive")
+  library(googledrive)
+}
+
+if (!require(googlesheets4)) {
+  install.packages("googlesheets4")
+  library(googlesheets4)
+}
+```
+
+# The code
+
+This function is used to download a file from a given DOI, and is the main workhorse of this script.
+
+
+```{r}
+download_file <- function(row, oa_email_key, journal_path = "", use_proxy = FALSE, proxy_address = "socks5://localhost:9051", use_sci_hub = FALSE, source_overview = TRUE) {
+  # The URL of the page containing the download link
+
+  doi_filename <- gsub("[^[:alnum:]]", "", row$doi)
+  # check if directory for journal exists and create it if not
+  if (!dir.exists(paste0("./downloads/", journal_path))) {
+    dir.create(paste0("./downloads/", journal_path), recursive = TRUE)
+  }
+  # check if file already exists and is larger than 40 kb (which hints at a valid pdf file)
+  if (file.exists(paste0("./downloads/", journal_path, "/", doi_filename, ".pdf")) && file.size(paste0("./downloads/", journal_path, "/", doi_filename, ".pdf")) > 20000) {
+    message("File already exists")
+    return()
+  } else {
+    Sys.sleep(5)
+  }
+
+  # get open access version from roadoi
+  oadoi_fetch <- oadoi_fetch(
+    dois = row$doi,
+    email = oa_email_key
+  )
+  # check if open access version exists
+  best_url <- oadoi_fetch$best_oa_location[[1]]$url
+  # if not, set best url to empty string
+  if(is.null(best_url)){
+    best_url = ""
+  }
+  # try download file from best url and fall back to other urls if not possible
+  if(length(oadoi_fetch$best_oa_location[[1]]) > 0){
+    tryCatch(
+        {
+          # download file from best url
+          suppressWarnings(download.file(url = best_url, destfile = paste0("./downloads/", journal_path, "/", doi_filename, ".pdf"), mode = "wb"))
+          # check if file is larger than 40 kb
+          if (file.size(paste0("./downloads/", journal_path, "/", doi_filename, ".pdf")) < 20000) {
+            stop("File is too small, falling back on other urls")
+          } else {
+            message("Download successful from ", best_url)
+            if(source_overview == TRUE){
+              write.table(data.frame(doi = row$doi, method = "open_access"),paste0("./downloads/", journal_path, "/", "source_overview", ".csv"), append = TRUE, row.names = FALSE, col.names = FALSE)
+            }
+            return()
+          }
+        },
+        # Handle the error
+        error = function(e) {
+          message("Error: ", e)
+          message("Trying other urls")
+          for (i in 1:length(oadoi_fetch$oa_locations)) {
+            Sys.sleep(1)
+            tryCatch(
+              { 
+                # download file from other urls if previous ones failed
+                download.file(url = oadoi_fetch$oa_locations[[i]]$url, destfile = paste0("./downloads/", journal_path, "/", doi_filename, ".pdf"), mode = "wb")
+                message("Download successful from ", oadoi_fetch$oa_locations[[i]]$url)
+                if (file.size(paste0("./downloads/", journal_path, "/", doi_filename, ".pdf")) < 20000) {
+                  stop("File is too small, falling back on other urls")
+                } else {
+                  message("Download successful from ", oadoi_fetch$oa_locations[[i]]$url)
+                  return()
+                }
+              },
+              error = function(e) {
+                message("Error: ", e)
+                message("Trying next url")
+              }
+            )
+          }
+        }
+      )
+  } else {
+    message("no open access URLS found...")
+  }
+  tryCatch(
+    {
+        if(source_overview == TRUE){
+          write.table(data.frame(doi = row$doi, method = "manual"),paste0("./downloads/", journal_path, "/", "source_overview", ".csv"), append = TRUE, row.names = FALSE, col.names = FALSE)
+        }        
+        df2bib(row, file = paste0("./downloads/", journal_path, "/", "manual_download_list.bib"), append = TRUE)
+        message("No open access version found. Appending it to overview for manual download")
+    },
+    # if all activated options failed, append the paper to a bibtex file for manual download
+    error = function(e) {
+      if(source_overview == TRUE){
+        write.table(data.frame(doi = row$doi, method = "manual"),paste0("./downloads/", journal_path, "/", "source_overview", ".csv"), append = TRUE, row.names = FALSE, col.names = FALSE)
+      }
+      message("Failed to download files from any source. Appending it to overview for manual download")
+      df2bib(row, file = paste0("./downloads/", journal_path, "/", "manual_download_list.bib"), append = TRUE)
+    },
+    warning = function(w) {
+      message("Warning: ", w$message)
+    }
+  )
+}
+```
+
+# Different ways to load a list of DOIS for downloading
+
+The code below is how we actually download the pdfs. 
+We can either load a list of DOIs from a bibtex file or from a google sheet.
+The google sheet needs to be defined in the secret_vars.R file. 
+
+## From a bibtex list
+```{r}
+bib <- bib2df("bibtex_file.bib")
+names(bib)[which(names(bib) == "DOI")] <- "doi"
+names(bib)[which(names(bib) == "URL")] <- "link"
+
+last_i <- 1
+ for(i in last_i:nrow(bib)){
+      last_i <- i
+      Sys.sleep(1)
+      download_file(bib[i,], oa_email_key, journal_path = "", use_proxy = TRUE, proxy_address = "socks5://127.0.0.1:9051")
+      print(paste0("downloaded (or added to manual download list) paper ", i, " of ", nrow(bib), " with doi: ", bib$doi[i]))
+}
+```
+
+## From a google sheet
+
+For details on Google Sheet use see the `fetch_from_scopus.Rmd` file. 
+First we authenticate, then we get the google sheet and then we download the papers.
+
+```{r}
+# get the google sheet with the publication data
+drive_auth()
+gs4_auth(token = drive_token())
+gs_sheets <- gs4_get(google_sheet_url)
+pubdata_dfs <- sapply(gs_sheets$sheets$name[5], function(x) read_sheet(gs_sheets, sheet = x), simplify = FALSE)
+
+for (name in names(pubdata_dfs)) {
+  bib <- data.frame(pubdata_dfs[[name]])
+  journal_path <- str_replace_all(name, " ", "_")
+  last_i <- 1
+  for (i in last_i:nrow(bib)) {
+    last_i <- i
+    print("#################################################################")
+    print(paste0("Downloading paper ", i, " of ", nrow(bib), " with doi: ", bib$doi[i]))
+    if(is.na(bib[i,])){
+      print("doi is NA, skipping and marking for manual download") 
+      bib_file <- readLines(paste0("./downloads/", journal_path, "/", "manual_download_list.bib"))
+      # replace @ with @article
+      bib_file <- gsub("@", "@article", bib_file)
+      # write file
+      writeLines(bib_file, paste0("./downloads/", journal_path, "/", "manual_download_list.bib"))
+      next
+    }
+    download_file(bib[i, ], oa_email_key, journal_path = journal_path, use_proxy = TRUE, proxy_address = "socks5://localhost:9050", use_sci_hub = TRUE)
+    print(paste0("downloaded (or added to manual download list) paper ", i, " of ", nrow(bib), " with doi: ", bib$doi[i]))
+    # Sys.sleep(5)
+  }
+  # to make the manual_download_list.bib file importable by Zotero, we need to replace all @ with @article
+  # read file
+  # check if file exists
+  if (file.exists(paste0("./downloads/", journal_path, "/", "manual_download_list.bib"))) {
+    bib_file <- readLines(paste0("./downloads/", journal_path, "/", "manual_download_list.bib"))
+    # replace @ with @article
+    bib_file <- gsub("@", "@article", bib_file)
+    # write file
+    writeLines(bib_file, paste0("./downloads/", journal_path, "/", "manual_download_list.bib"))
+  } else {
+    message("No manual_download_list.bib file found, probably all papers were downloaded")
+  }
+}
+
+```
+
+## from a csv file
+
+```{r}
+
+pubdata_dfs <- read.csv("mydata.csv") 
+
+last_i <- 1
+for (i in last_i:nrow(bib)) {
+  journal_path <- str_replace_all(bib$journal[i], " ", "_")
+  last_i <- i
+  print("#################################################################")
+  print(paste0("Downloading paper ", i, " of ", nrow(bib), " with doi: ", bib$doi[i]))
+  if(is.na(bib$doi[i])){
+    print("doi is NA, skipping and marking for manual download") 
+    bib_file <- readLines(paste0("./downloads/", journal_path, "/", "manual_download_list.bib"))
+    # replace @ with @article
+    bib_file <- gsub("@", "@article", bib_file)
+    # write file
+    writeLines(bib_file, paste0("./downloads/", journal_path, "/", "manual_download_list.bib"))
+    next
+  }
+  download_file(bib[i, ], oa_email_key, journal_path = journal_path, use_proxy = TRUE, proxy_address = "socks5://localhost:9050", use_sci_hub = TRUE)
+  print(paste0("downloaded (or added to manual download list) paper ", i, " of ", nrow(bib), " with doi: ", bib$doi[i]))
+  # Sys.sleep(5)
+}
+# to make the manual_download_list.bib file importable by Zotero, we need to replace all @ with @article
+# read file
+# check if file exists
+if (file.exists(paste0("./downloads/", journal_path, "/", "manual_download_list.bib"))) {
+  bib_file <- readLines(paste0("./downloads/", journal_path, "/", "manual_download_list.bib"))
+  # replace @ with @article
+  bib_file <- gsub("@{,", "@article{,", bib_file, fixed = TRUE)
+  # write file
+  writeLines(bib_file, paste0("./downloads/", journal_path, "/", "manual_download_list.bib"))
+} else {
+  message("No manual_download_list.bib file found, probably all papers were downloaded")
+}
+
+# lets see how many files were downloaded from open access:
+source_overview <- read.table(paste0("./downloads/", journal_path, "/source_overview.csv"))
+sum(source_overview$V2 == "open_access")
+
+
+```
+
+
+
+# Manual downloads
+
+In case the automatic download fails, we can download the papers manually from Zotero.
+
+For this, download and install Zotero from <a href="https://www.zotero.org/download/">https://www.zotero.org/download/</a>.
+
+Then, open Zotero and, if this is the first time you import something for a project add a new library by clicking on the "New Library" button in the top left corner. 
+Then add a new collection for the journal by clicking on the "New Collection" button in the top left corner. 
+Then, click on the "File" menu and select "Import from File".
+Select the "manual_download_list.bib" file from the downloads folder and click "Open".
+Zotero will import the papers into a collection called "manual_download_list" with some timestamp.
+Move the files in this collection into the collection with the journal name that you created earlier by drag and drop.
+
+Now we follow the following steps for downloading the missing PDFs:
+
+1. As zotero has some additional functionality compared to the open access lookup, we can try to download the PDFs from the open access sources that Zotero knows about. For this, select all articles in the collection and right click on the selection, and select "Find Available PDFs". Zotero will now try to download the PDFs from the open access sources that it knows about. If it finds a PDF, it will automatically add it to the entry in the collection. 
+2. If there are still pdfs that have not been found, (actually the more pdfs you look up the less likely zotero is to find them because publishers will temporarily block your IP if you look up too many PDFs), you can **connect to the University VPN** and download them via Zotero's library lookup function. For this,
+   1.  go to Edit > Preferences > Advanced, and in the OpenURL option, select your continent, country and institution. 
+   2.  Select an article (yes, a single one), click on the green rightward arrow in the top right corner of the window and select "Library Lookup". Zotero will now try to find the article in the library of your institution.
+   3.  If it finds the article, it will open a new tab in your browser with the article. Download the article and add it to the entry in the collection.
+
+This should eventually result in all articles being available. 
+Obviously, the Zotero steps still take a lot of manual work, but it is still better than downloading all articles from the web.

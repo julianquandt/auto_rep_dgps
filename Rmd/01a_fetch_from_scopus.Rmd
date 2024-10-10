@@ -1,0 +1,708 @@
+---
+title: "Fetching Paper and Journal metadata from Scopus"
+author: "Julian Quandt"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output: 
+  html_document:
+    theme: cerulean
+    highlight: tango
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    self_contained: true
+    code_folding: hide
+    code_download: true
+---
+
+
+
+
+
+```{r, include = FALSE}
+# set options to not knit code chunks
+knitr::opts_chunk$set(echo = TRUE, eval = TRUE, include = TRUE, warning = FALSE, message = FALSE)
+if (!require(kableExtra)) {
+  install.packages("kableExtra")
+  library(kableExtra)
+}
+```
+
+# About
+
+This file demonstrates how to use the Scopus Api to collect all papers from a journal or list of journals. 
+Moreover, it shows how to collect the metadata of the journals themselves.
+
+<div style="border: 1px solid #999; border-radius: 5px; padding: 20px; margin-top: 20px; background-color: #ffffe0;">
+  <h3 style="color: #0056b3; margin-top: 0;">The code in this document</h3>
+  In this HTML version of the document, the code chunks that are just doing background work or intermediate steps are hidden to make it more readable. If you want to see the code, you can click on the "Show" buttons on the right hand side of the text. To run the code in R yourself, download the .Rmd file by clicking on the "Code" button on the top right of the document and then selecting "Download Rmd".
+</div>
+
+
+# Prerequisites
+
+## Scopus API key
+
+First, you need to get a scopus API key. You can get one for free by registering at https://dev.elsevier.com/apikey/manage
+
+Once you have obtained your scopus API key, make sure that you store it in a file called `secret_vars.R` in the same directory as this file. The file should contain the following line:
+
+`scopus_key = 'YOUR_SCOPUS_API_KEY'`
+
+Replace the `YOUR_SCOPUS_API_KEY` with your actual API key, but make sure to keep the `'` around the key.
+
+<div style="border: 1px solid #999; border-radius: 5px; padding: 20px; margin-top: 20px; background-color: #ffffe0;">
+  <h3 style="color: #0056b3; margin-top: 0;">Remarks about Scopus API</h3>
+Do NEVER load your API key into the file directly, so you can share it without exposing your API key. If you are using version control or are uploading this directory in any way, make sure that the secret_vars.R file is excluded from the upload.
+
+Due to restrictions in the Scopus API you will only be able to run this code when connected to the university network (either by VPN or on campus). 
+</div>
+
+
+We will now load the API key from the file into R. This will make it available to the code that we will run later.
+
+```{r, class.source = "fold-show"}
+source("secret_vars.R")
+```
+
+
+## Installing and Loading Required Packages
+
+For this task, we need several R packages that are not part of the standard R installation.
+If you have not installed these packages yet, you can do so by running the following code chunk.
+
+```{r, class.source = "fold-show"}
+# rscopus
+if (!require(rscopus)) {
+  install.packages("rscopus")
+  library(rscopus)
+}
+#jsonlite
+if (!require(jsonlite)) {
+  install.packages("jsonlite")
+  library(jsonlite)
+}
+# googledrive
+if (!require(googledrive)) {
+  install.packages("googledrive")
+  library(googledrive)
+}
+# googlesheets4
+if (!require(googlesheets4)) {
+  install.packages("googlesheets4")
+  library(googlesheets4)
+}
+# stringr
+if (!require(stringr)) {
+  install.packages("stringr")
+  library(stringr)
+}
+# plyr
+if (!require(plyr)) {
+  install.packages("plyr")
+  library(plyr)
+}
+# httr
+if (!require(httr)) {
+  install.packages("httr")
+  library(httr)
+}
+```
+
+The code above loads the required packages or installs them if not available. 
+This is an overview of what we need the packages for:
+
+- `rscopus` provides an interface to the Scopus API
+- `jsonlite` is used to convert the JSON responses from the Scopus API to R data frames
+- `googledrive` is used to access Google Drive and provides access to Google Sheets
+- `googlesheets4` is used to upload our results to Google Sheets
+- `stringr` is used for several operations on the strings in data frames (e.g., extracting the doi from the reference column)
+- `plyr` is used for several operations on the data frames (e.g., converting lists to data frames)
+- `httr` is used to fetch data from scopus beyond what is provided by the rscopus package.
+
+## Defining some functions that we will need later
+
+First we need to define some functions in R that we will need later, to do some sub-operations on the way to our finished data frame containing the paper and journal metadata.
+It is not important to understand those (which is why they are hidden by default in this document), but you can have a look at them if you are interested by clicking on the Show buttons on within the text.
+
+```{r}
+add_colname_suffix <- function(colnames) {
+  # Initialize an empty vector to hold the new unique names
+  unique_names <- character(length(colnames))
+
+  # Use a named vector to keep track of counts for each unique name
+  name_count <- integer(0)
+
+  for (i in seq_along(colnames)) {
+    name <- colnames[i]
+
+    # Update the count for this name
+    if (!name %in% names(name_count)) {
+      name_count[name] <- 0
+    }
+    name_count[name] <- name_count[name] + 1
+
+    # Create a new unique name using the count as a suffix
+    if (name_count[name] > 1) {
+      new_name <- paste0(name, ".", name_count[name])
+    } else {
+      new_name <- name
+    }
+
+    # Store the new unique name in the result vector
+    unique_names[i] <- new_name
+  }
+
+  # Show the vector with unique names
+  return(unique_names)
+}
+
+# Function to get overall cite score information
+get_overall_citescore <- function(body) {
+  return(body[1:which(names(body) == "citeScoreSubjectRank") - 1])
+}
+
+# Function to append subject codes to column names
+append_subject_codes <- function(subjectranks) {
+  for (k in seq_along(subjectranks)) {
+    subject_code <- subjectranks[[k]]$subjectCode
+    names(subjectranks[[k]]) <- paste0(names(subjectranks[[k]]), ".", subject_code)
+  }
+  return(subjectranks)
+}
+
+# Function to convert list to dataframe row
+list_to_row <- function(lst) {
+  rowdata <- unlist(lst)
+  return(data.frame(t(rowdata), stringsAsFactors = FALSE))
+}
+# Function to concatenate non-NA authname for each row
+concat_authname <- function(row) {
+  # Omit NA and concatenate
+  authors_unformatted <- paste(na.omit(row), collapse = ", ")
+  authors_formatted <- gsub(" ([A-Z])\\.", ", \\1\\.", authors_unformatted)
+
+  return(authors_formatted)
+}
+
+get_column_value <- function(df, column_name) {
+  if (!is.null(df[[column_name]])) {
+    ifelse(is.na(df[[column_name]]), NA, df[[column_name]])
+  } else {
+    NA
+  }
+}
+
+to_apa_title_case <- function(str) {
+  minor_words <- c(
+    "and", "as", "but", "for", "if", "nor", "or", "so", "yet",
+    "a", "an", "the",
+    "as", "at", "by", "for", "in", "of", "off", "on", "per", "to", "up", "via"
+  )
+
+  # Helper function to capitalize a single word
+  capitalize <- function(word) {
+    first_letter_pos <- regexpr("[a-zA-Z]", word)[1]
+    prefix <- substr(word, 1, first_letter_pos - 1)
+    first_letter <- substr(word, first_letter_pos, first_letter_pos)
+    suffix <- substr(word, first_letter_pos + 1, nchar(word))
+    paste0(prefix, toupper(first_letter), suffix)
+  }
+
+  # Convert to lowercase
+  str <- tolower(str)
+
+  # Split string into words
+  words <- unlist(strsplit(str, " "))
+
+  # Capitalize remaining words based on APA rules
+  words <- unname(sapply(words, function(x) ifelse(x %in% minor_words, x, capitalize(x))))
+
+  # Capitalize the word after a colon
+  after_colon <- grep(": [a-z]", str)
+  if (length(after_colon) > 0) {
+    words[after_colon] <- capitalize(words[after_colon])
+  }
+
+  # Capitalize second part of hyphenated major words and words of four letters or more
+  hyphen_splits <- strsplit(words, "-")
+  hyphen_splits <- lapply(hyphen_splits, function(x) {
+    if (length(x) > 1 || nchar(x[[1]]) >= 4) {
+      x <- capitalize(x)
+    }
+    return(x)
+  })
+  words <- sapply(hyphen_splits, paste, collapse = "-")
+
+  return(paste(words, collapse = " "))
+}
+
+```
+
+Here is a verbal description of what the functions do:
+
+- `add_colname_suffix` gives unique names to columns that occur multiple times in the scopus data (e.g. if a paper has multiple authors, they are stored in columns `author.authorname`, `author.authorname.1`, `author.authorname.2`, etc.). This function adds a suffix to the column names to make them unique.
+- `get_overall_citescore` extracts the overall cite score information for a given journal from the scopus data
+- `append_subject_codes` appends the subject codes to the column names of the subject ranks
+- `list_to_row` converts a list to a data frame row
+- `concat_authname` concatenates the author names in APA style
+- `get_column_value` extracts the value of a column from a data frame if it exists, otherwise returns NA
+- `to_apa_title_case` uses the paper metadata to create a title in correct APA style.
+
+# Main Functions
+
+## Retrieving the Data from Scopus
+
+The function works in the following way:
+
+1. It queries the scopus API for all papers in a given journal or list of journals for a given time period
+2. It processes the results of the query to create a data frame with the paper metadata
+3. It queries the scopus API for the metadata of the journals
+4. It merges the paper metadata with the journal metadata
+5. It returns the merged data frame
+
+For convenience, there is a function that does all of these steps simultaneously. Thus, the only thing that you need to do in the end is to provide a list of ISSNs for all journals you are interested in and the time period for which you want to query the data.
+
+This piece of code will look like this:
+
+```{r, eval = FALSE, class.source = "fold-show"}
+issn_list <- c(
+  "0001-4273",
+  "0002-8282"
+)
+
+publications_2022_to_2023 <- query_and_process(
+  pubyear_start = 2022,
+  pubyear_end = 2023,
+  issn_list = issn_list,
+  max_count = 1e5
+)
+```
+
+This example uses the ISSN of the Academy of Management Journal and American Economic Review as an example. You can add as many ISSNs as you want to the list.
+Then we call the function that does all the work in the background. We give it the relevant information to process by providing the following arguments to the function: 
+
+- `pubyear_start` is the first year for which we want to query the data
+- `pubyear_end` is the last year for which we want to query the data
+- `issn_list` is the list of ISSNs for which we want to query the data (we do just tell it here that we have defined a list called `issn_list` above)
+- `max_count` is the maximum number of papers that we want to query for each journal. This is a parameter of the scopus API. It is set to a very high number here (1e5 = 100,000) to make sure that we get all papers. If you want to limit the number of papers per journal (for example for testing purposes), you can set this to a lower number (e.g. 10 or 20).
+
+After running all of the code chunks below in the order in which they appear, you should be able to fetch the data for the journals you are interested in.
+
+## Function Retrieving Journal MetaData
+
+Next we created a function that retrieves the journal metadata from the scopus API. You do only need to execute the code chunk to load the function. Calling it yourself will not be necessary, as it will be done automatically by running the code that was demonstrated above. 
+
+```{r}
+retrieve_journal_metadata <- function(issn_list) {
+
+  # Initialize empty dataframe
+  journal_meta_df <- NULL
+
+  # Get journal metadata from Scopus for each ISSN
+  for (issn in issn_list){
+    response <- httr::GET(
+      url = paste0(
+        "https://api.elsevier.com/content/serial/title/issn/", issn,
+        "?apiKey=", scopus_key,
+        "&view=CITESCORE"
+      )
+    )
+
+    # Convert response to list
+    response_list <- content(response)
+    journal_citestats <-  response_list$`serial-metadata-response`$entry[[1]]$`citeScoreYearInfoList`$citeScoreYearInfo
+    # Initialize empty dataframe for the citestats data
+    journal_citestats_df <- NULL
+
+    # Iterate through the citestats data that is returned for each year and different subject areas
+    for (i in seq_along(journal_citestats)) {
+      tmp_citescores <- journal_citestats[[i]]
+
+      tmp_citescors_metainfo <- c(year = tmp_citescores$`@year`, status = tmp_citescores$`@status`)
+
+      tmp_citescores_body <- tmp_citescores$citeScoreInformationList[[1]]$citeScoreInfo[[1]]
+
+      tmp_citescores_overall <- get_overall_citescore(tmp_citescores_body)
+
+      tmp_citescores_subjectranks <- append_subject_codes(tmp_citescores_body$citeScoreSubjectRank)
+
+      rowdata <- c(tmp_citescors_metainfo, tmp_citescores_overall, unlist(tmp_citescores_subjectranks))
+
+      if (is.null(journal_citestats_df)) {
+        journal_citestats_df <- data.frame(matrix(NA, nrow = 0, ncol = length(rowdata)))
+        colnames(journal_citestats_df) <- names(rowdata)
+      }
+
+      journal_citestats_df <- rbind.fill(journal_citestats_df, list_to_row(rowdata))
+    }
+
+    # extract the general metadata body and add it to the citestats data
+    journal_metadata_body <- response_list$`serial-metadata-response`$entry[[1]]
+    journal_citestats_df$journal_meta_title <- journal_metadata_body$`dc:title`
+    journal_citestats_df$publisher <- journal_metadata_body$`dc:publisher`
+    journal_citestats_df$journal_coverageStartYear <- journal_metadata_body$`coverageStartYear`
+    journal_citestats_df$journal_coverageEndYear <- journal_metadata_body$`coverageEndYear`
+    journal_citestats_df$journal_issn <- gsub("-", "", journal_metadata_body$`prism:issn`)
+    journal_citestats_df$journal_is_openAccess <- ifelse(is.null(journal_metadata_body$`openaccess`), 0, 1)
+    journal_citestats_df$openAccess_articles <- ifelse(is.null(journal_metadata_body$`openAccessArticle`), 0, journal_metadata_body$`openAccessArticle`)
+    journal_citestats_df$openArchive_articles <- ifelse(is.null(journal_metadata_body$`openArchiveArticle`), 0, journal_metadata_body$`openArchiveArticle`)
+    journal_citestats_df$openAccess_type <- ifelse(is.null(journal_metadata_body$`openaccessType`), NA, journal_metadata_body$`openaccessType`)
+    journal_citestats_df$openAccess_start_date <- ifelse(is.null(journal_metadata_body$`openaccessStartDate`), NA, journal_metadata_body$`openaccessStartDate`)
+    journal_citestats_df$openAccess_allow_author_paid <- ifelse(is.null(journal_metadata_body$`openaccessAllowAuthorPaid`), 0, 1)
+
+    # remove columns that are not needed
+    journal_citestats_df <- droplevels(journal_citestats_df[, -grep("X._", names(journal_citestats_df))])
+    if (is.null(journal_meta_df)) {
+      journal_meta_df <- journal_citestats_df
+    } else {
+      journal_meta_df <- rbind.fill(journal_meta_df, journal_citestats_df)
+    }
+  }
+  # return the journal metadata
+  return(journal_meta_df)
+}
+```
+
+## Function Processing Fetched Data
+
+One thing that we need to do when we want to use Scopus data is to put it in to a format that is easier to work with.
+The following two functions do this, by processing the data that we get from the scopus API and running different operations. 
+Again, this is only a function that does work in the background as an intermediate step. You only need to run the code chunk to make it available, but you do not need to execute it.
+
+Specifically, the code below contains 2 functions:
+
+- `queried_items_to_df` converts the data that we get from the scopus API to a data frame
+- `process_queried_items_df` processes the data frame that we get from `queried_items_to_df` to make it easier to work with
+
+Again, if you are interested click on the Show button to inspect the code.
+
+```{r}
+# create a data frame of the list of queried items
+queried_items_to_df <- function(query_return) {
+
+  # create empty data frame to store results
+
+  # Find the maximum number of columns in any entry
+  ncols_per_entry <- sapply(query_return, function(x) length(unlist(x)))
+  max_ncol <- max(ncols_per_entry)
+
+  # Find the column names for the entry with the maximum number of columns
+  colnames_raw <- names(unlist(query_return[[which(ncols_per_entry == max_ncol)[1]]]))
+
+  # Create a data frame with the maximum number of columns
+  queried_items_df <- data.frame(matrix(NA, nrow = length(query_return), ncol = max_ncol))
+
+  # Add suffixes to the column names to make them unique and assign them to the data frame
+  max_unique_colnames <- add_colname_suffix(colnames_raw)
+  colnames(queried_items_df) <- max_unique_colnames
+
+  for (i in seq_along(query_return)) {
+    # iterate through list and store results of each entry to a row in the data frame
+    tmp_queried_items <- unlist(query_return[[i]])
+
+    # Add suffixes to the temporary data column names to make them unique
+    tmp_unique_colnames <- add_colname_suffix(names(tmp_queried_items)) 
+    names(tmp_queried_items) <- tmp_unique_colnames
+
+    # Find indices where tmp_queried_items keys match max_unique_colnames
+    matched_indices <- match(names(tmp_queried_items), max_unique_colnames, nomatch = 0)
+
+    # Only keep those which have a match (i.e., non-zero indices)
+    has_match <- matched_indices > 0
+
+    if (any(has_match)) {
+      queried_items_df[i, matched_indices[has_match]] <- tmp_queried_items[has_match]
+    }
+  }
+
+  return(queried_items_df)
+}
+
+# process the queried_items_df
+process_queried_items_df <- function(queried_items_df, vars_to_keep = c()) {
+  processed_df <- droplevels(subset(queried_items_df, subtypeDescription == "Article"))
+
+  # get all columns that contain author names
+  authname_cols <- grep("author\\.authname", names(processed_df))
+  # concaternate author names in APA style by pattern matching all author.authorname.suffix variables
+  authors_apa <- apply(processed_df[, authname_cols], 1, concat_authname)
+  
+  # get publication year in APA style
+  pupyear_apa <- unname(sapply(processed_df[, "prism:coverDate"], function(x) substr(x, 1, 4)))
+
+  # get title in APA style
+  title_apa <- unname(sapply(processed_df$`dc:title`, function(x) to_apa_title_case(x)))
+
+  # get journal and publication info in APA style
+  journal_apa <- get_column_value(processed_df, "prism:publicationName")
+  volume_apa <- get_column_value(processed_df, "prism:volume")
+  issue_apa <- get_column_value(processed_df, "prism:issueIdentifier")
+  pages_apa <- get_column_value(processed_df, "prism:pageRange")
+  doi_apa <- paste0("https://doi.org/", processed_df$`prism:doi`)
+
+  # create a bibliography entry in APA style for the fetched articles
+  apa_references <- sprintf(
+    "%s (%s). %s. %s, %s(%s)%s. %s",
+    ifelse(is.na(authors_apa) | authors_apa == "", "", authors_apa),
+    ifelse(is.na(pupyear_apa) | pupyear_apa == "", "", pupyear_apa),
+    ifelse(is.na(title_apa) | title_apa == "", "", title_apa),
+    ifelse(is.na(journal_apa) | journal_apa == "", "", journal_apa),
+    ifelse(is.na(volume_apa) | volume_apa == "", "", volume_apa),
+    ifelse(is.na(issue_apa) | issue_apa == "", "", issue_apa),
+    ifelse(is.na(pages_apa) | pages_apa == "", "", paste0(", ", pages_apa)),
+    ifelse(is.na(doi_apa) | doi_apa == "", "", doi_apa)
+  )
+
+  # get the columns that we want to keep (by default vars_to_keep is empty, because we create all relevant columns ourselves)
+  # should you need to change it, you can do so by providing a vector of column names to the function
+  processed_df_final <- processed_df[, which(names(processed_df) %in% vars_to_keep)]
+
+  processed_df_final$journal_issn <- processed_df$`prism:issn`
+  processed_df_final$title <- title_apa
+  processed_df_final$authors <- authors_apa
+  processed_df_final$journal <- journal_apa
+  processed_df_final$year <- pupyear_apa
+  processed_df_final$volume <- volume_apa
+  processed_df_final$issue <- issue_apa
+  processed_df_final$pages <- pages_apa
+  processed_df_final$doi <- processed_df$`prism:doi`
+  processed_df_final$apa_reference <- apa_references
+  processed_df_final$link <- doi_apa
+  processed_df_final$citation_count <- processed_df$`citedby-count`
+  processed_df_final$abstract <- processed_df$`dc:description`
+  processed_df_final$first_author_affiliation <- processed_df$`affiliation.affilname`
+  processed_df_final$first_author_country <- processed_df$`affiliation.affiliation-country`
+  processed_df_final$open_access <- processed_df$`openaccess`
+  processed_df_final$n_authors <- processed_df$`author-count.$`
+
+  # sort by year, volume, issue
+  processed_df_final <- processed_df_final[order(-as.numeric(processed_df_final$year), -as.numeric(processed_df_final$volume), -as.numeric(processed_df_final$issue)), ]
+
+  # return the processed data frame
+  return(processed_df_final)
+}
+```
+
+# The function that uses all of the above to produce the end result
+
+Finally, we have a function that combines all of the code that we saw above and uses it to produce a data set of the end result that we want to have.
+
+```{r, class.source = "fold-show"}
+# create a data frame of the list of queried items
+query_and_process <- function(pubyear_start, pubyear_end, issn_list, max_count = 1e5) {
+
+  # create empty data frame to store results
+  processed_df_final <- NULL
+
+  # run the queries for the given time period and list of ISSNs
+  for(issn in issn_list){
+    
+    query_return <- rscopus::scopus_search(query = paste0("ISSN(", issn, ") AND PUBYEAR > ", (pubyear_start-1), " AND PUBYEAR < ", (pubyear_end+1)), view="COMPLETE", max_count = max_count, api_key = scopus_key, count = 25, verbose = FALSE, wait_time = 1)
+
+    # if there are no results for the given ISSN, skip it
+    if(query_return$total_results == 0){
+      message(paste0("no results for ISSN: ", issn, " for years ", pubyear_start, " to ", pubyear_end, ". Skipping..."))
+      next
+    }
+    # print a message to show progress
+    print(paste0("queried journal with ISSN: ",  issn, ". Number of journals left: ", length(issn_list) - which(issn_list == issn)))
+    
+    # convert the queried items to a data frame by calling the queried_items_to_df function from above
+    queried_items_df <- queried_items_to_df(query_return[[1]])
+    # process the queried items by calling the process_queried_items_df function from above
+    processed_item_df <- process_queried_items_df(queried_items_df)
+    # merge the processed items with the previously processed items
+    if(is.null(processed_df_final)){
+      processed_df_final <- processed_item_df
+    } else {
+      processed_df_final <- rbind.fill(processed_df_final, processed_item_df)
+    }
+  }
+  # if there are no results for any of the ISSNs, return NULL
+  if(is.null(processed_df_final)){
+    message("None of the ISSNs had any results, returning NULL")
+    return(NULL)
+  }
+  # retrieve the journal metadata by calling the retrieve_journal_metadata function from above
+  journal_metadata <- retrieve_journal_metadata(issn_list)
+  # merge the processed items with the journal metadata
+  processed_df_final <- merge(processed_df_final, journal_metadata, by = c("journal_issn", "year"), all.x = TRUE)
+  # remove columns that are not needed
+  processed_df_final <- droplevels(processed_df_final[, -grep("@_fa", names(processed_df_final))])
+  # return the processed data frame
+  return(processed_df_final)
+}
+```
+
+# Example 
+
+## Running the Example of fetching the data for the Academy of Management Journal and American Economic Review
+
+After executing all of the above code chunks once, we can now finally run the example from the beginning. This time we will only use 20 papers per journal to make sure that the code runs quickly. If you want to fetch all papers, you can set the `max_count` parameter to a very high number (e.g. 1e5 = 100,000)
+
+```{r, eval = TRUE, class.source = "fold-show"}
+issn_list <- c(
+  "0001-4273",
+  "0002-8282"
+)
+
+publications_2022_to_2023 <- query_and_process(
+  pubyear_start = 2022,
+  pubyear_end = 2023,
+  issn_list = issn_list,
+  max_count = 20
+)
+```
+
+When running this, you will see that you got some warning messages about not all papers being retrieved:
+
+`In rscopus::scopus_search(query = paste0("ISSN(", issn, ") AND PUBYEAR > ",  : May not have received all entries"`
+
+This occurs because we asked Scopus to only get 20 papers per journal. Thus the warning can be ignored because it was caused by our request to only get 20 papers per journal.
+
+Lets have a look at the resulting data (note that long columns like abstracts and references are truncated to 100 characters to make the table easier to read):
+
+```{r, eval = TRUE}
+
+# we show the head of the data frame with long columns (like abstracts and references) truncated to 100 characters
+head_df <- data.frame(lapply(head(publications_2022_to_2023), function(x) {
+  if(is.character(x)) {
+    # Truncate string to a maximum length, for example, 10 characters
+    substr(x, 1, 100)
+  } else {
+    x
+  }
+}))
+
+kable(head_df, format = "html", table.attr = "class='table table-striped'")
+```
+
+
+The following is a codebook explaining the meaning of the variables in the dataset:
+
+```{r, echo = FALSE}
+# create a data frame with the variable names of head_df and their descriptions
+codebook_df <- data.frame(
+  variable = c(
+    "journal_issn",
+    "year",
+    "title",
+    "authors",
+    "journal",
+    "volume",
+    "issue",
+    "pages",
+    "doi",
+    "apa_reference",
+    "link",
+    "citation_count",
+    "abstract",
+    "first_author_affiliation",
+    "first_author_country",
+    "open_access",
+    "n_authors",
+    "status",
+    "docType",
+    "scholarlyOutput",
+    "citationCount",
+    "citeScore",
+    "percentCited",
+    "subjectCode.X",
+    "rank.X",
+    "percentile.X",
+    "...",
+    "journal_meta_title",
+    "publisher",
+    "journal_coverageStartYear",
+    "journal_coverageEndYear",
+    "journal_is_openAccess",
+    "openAccess_articles",
+    "openArchive_articles",
+    "openAccess_type",
+    "openAccess_start_date",
+    "openAccess_allow_author_paid"
+  ),
+  description = c(
+    "ISSN of the journal that the row's article is from",
+    "Year of publication",
+    "Title of the article in APA style",
+    "All authors of the article in APA style",
+    "Journal name",
+    "Volume",
+    "Issue",
+    "Pages",
+    "DOI",
+    "APA style reference",
+    "Link to the article (resolved via dx.doi.org)",
+    "Current number of citations of specific article",
+    "Abstract of the article",
+    "Affiliation of the first author",
+    "Country of Affiliation of the first author during publication",
+    "Whether the article is open access",
+    "Number of authors",
+    "Status of the current citation score metrics: In-Progress when information was fetched before the year was over, completed when information for the respective year was already complete in scopus",
+    "Document type: shows All here because the citescores are computed for all document types in a journal (not only articles)",
+    "Number of scholarly outputs in the respective journal and year",
+    "Number of citations in the respective JOURNAL and year",
+    "CiteScore of the respective journal and year (CiteScore 2022 counts the citations received in 2019-2022 to articles, reviews, conference papers, book chapters and data papers published in 2019-2022, and divides this by the number of publications published in 2019-2022. Image showing arrow pointing from the year of the citation counts were receive to the 4 previous years when the documents were published Citations)",
+    "Percent of documents that received citations in the respective journal and year",
+    "Subject code of the respective subject area, that the following columns that have the suffix of this respecitve subject code refer to (e.g. if the subject code is 1004, the following columns with the suffix .1004 refer to the subject area 1004)",
+    "Rank of the journal in the respective subject area based on CiteScore",
+    "Percentile of the journal in the respective subject area based on CiteScore",
+    "same for other subject areas. As different journals have different subject areas, these are NA if the respective subject area does not apply to the journal",
+    "Title of the journal (sanity check because retrieved from metadata fetching)",
+    "Publisher of the journal",
+    "Year of the first publication in the journal",
+    "I do not understand this and could not find the info on it",
+    "Whether the journal is open access",
+    "Number of open access articles in the journal",
+    "Number of open archive articles in the journal",
+    "Type of open access",
+    "When did journal become OA",
+    "Whether the journal allows author paid open access"
+  )
+)
+
+kable(codebook_df, format = "html", table.attr = "class='table table-striped'")
+```
+
+# Uploading the Data to Google Sheets
+
+## Creating a Google Sheet
+
+As we do not want to accidentally overwrite data in an existing Google Sheet, we should create a new Google Sheet for the data.
+Of course, we can later copy the data on Google Drive directly or rename the sheet etc.
+
+### Authenticating R to access Google Drive
+
+First we need to run the following code. It will open a process to authenticate with Google Drive.
+
+```{r, eval = FALSE, class.source = "fold-show"}
+drive_auth()
+gs4_auth(token = drive_token())
+```
+
+### Uploading the Data to Google Drive
+
+Next, we need to specify a sheet that we would like to work on.
+As said, creating a new spreadsheet in googledrive would be the best way to do this. 
+
+So first, we specify the R data that we would like to upload to Google Drive, by creating a copy called `data_to_write`. This prevents us from having to change other code below.
+
+```{r, class.source = "fold-show", eval = FALSE}
+data_to_write <- publications_2022_to_2023 
+```
+
+Now, by just running the 2 lines below, we can create and upload our data to GoogleDrive. 
+
+```{r, eval = FALSE, class.source = "fold-show"}
+journal_dfs <- split(data_to_write, data_to_write$journal)
+
+gs_worksheet <- gs4_create(paste0("publication_data_", Sys.time()), sheets = journal_dfs)
+
+# save local R data frame copy
+saveRDS(journal_dfs, file = paste0("publication_data_", str_replace_all(Sys.time(), ":", ""), ".rds"))
+```
+```
+
+Thats it. 

@@ -1,0 +1,1032 @@
+---
+title: "Preprocessing XML files and extracting P-values"
+author: "Julian Quandt"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output: 
+  html_document:
+    theme: cerulean
+    highlight: tango
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    self_contained: true
+---
+
+```{r, include = FALSE}
+# set options to not knit code chunks
+knitr::opts_chunk$set(echo = TRUE, eval = FALSE, include = TRUE, warning = FALSE, message = FALSE)
+if (!require(kableExtra)) {
+  install.packages("kableExtra")
+  library(kableExtra)
+}
+library(XML)
+```
+
+# Helper functions
+
+First we define a few helper functions that will allow us to achieve more complex tasks later.
+One is to extract text from a a xml object, the other is to replace incorrect characters in the text, and the last one is to check if a paragraph contains specific patterns.
+
+```{r}
+
+# Define the namespace
+namespaces <- c(tei = "http://www.tei-c.org/ns/1.0")
+
+
+extract_text <- function(node) {
+  # Initialize an empty string to store paragraph text
+  paragraph_text <- ""
+
+  # Iterate over each child node of the paragraph
+  for (child in xmlChildren(node)) {
+    paragraph_text <- paste0(paragraph_text, xmlValue(child))
+  }
+
+  # Return the reconstructed paragraph text
+  return(paragraph_text)
+}
+
+# Example function to replace incorrect characters
+replace_characters <- function(text) {
+  text <- gsub("␤", "β", text)
+  text <- gsub("ϭ", "=", text)
+  text <- gsub("ð", "(", text)
+  text <- gsub("Ϫ", "-", text)
+  text <- gsub("Ͻ", "<", text)
+  text <- gsub("⌬R 2", "ΔR2", text)
+  text <- gsub("⌬F", "ΔF", text)
+  text <- gsub("⌬", "Δ", text)
+  text <- gsub("␥", "γ", text)
+  text <- gsub("\\[", "(", text)
+  text <- gsub("\\]", ")", text)
+  text <- gsub("b 5 2", "b = -", text)
+  text <- gsub("b 5", "b =", text)
+  text <- gsub("g 5", "g =", text)
+  text <- gsub("r 5", "r =", text)
+  text <- gsub("f 5", "f =", text)
+  text <- gsub(", ns", ", n.s.", text)
+  text <- gsub("p , ([0-9.]+)", "p < \\1", text)
+  text <- gsub("x 2 5", "X2 =", text)
+  text <- gsub("f 2 5", "f2 =", text)
+  text <- gsub("F 5", "F =", text)
+  text <- gsub("df 5", "df =", text)
+  text <- gsub("estimate 5", "estimate =", text)
+  text <- gsub("B 5", "B =", text)
+  text <- gsub("p $ ", "p ~ ", text)
+  text <- gsub("p 5", "p =", text)
+  text <- gsub("p # ", "p = ", text) # this is for p <=
+  text <- gsub("p \\. \\.([0-9]+)", "p > .\\1", text)
+  text <- gsub("([a-zA-Z\\)]) 5 ([0-9.-]+)", "\\1 = \\2", text)
+
+  return(text)
+}
+
+# Function to check if a paragraph contains specific patterns
+contains_patterns <- function(paragraph, patterns) {
+  for (pattern in patterns) {
+    if (grepl(pattern, paragraph, ignore.case = TRUE)) {
+      return(TRUE)
+    }
+  }
+  return(FALSE)
+}
+
+```
+
+# Extract p-values with context
+
+We want to extract p-values from the text of the xml files.
+To do this, we define a function that extracts p-values and their context from paragraphs.
+It is called from within the `extract_tests` function to extract the p-values from the paragraphs. 
+
+```{r}
+extract_p_values_with_context <- function(paragraphs) {
+  # Regex pattern to match p-values and "n.s."
+  pattern <- "\\bp(?:_[[:alnum:]]+)?\\s*[<>=]\\s*[0-9.]+\\b|\\bn\\.s\\.?\\b"
+
+
+  # Initialize an empty list to store the extracted p-values with context
+  extracted_p_values_with_context <- setNames(vector("list", length(paragraphs)), names(paragraphs))
+  raw_matches <- list()
+
+  # Iterate over each item in the paragraphs list
+  for (name in names(paragraphs)) {
+    if (length(paragraphs[[name]]) == 0) {
+      next
+    }
+
+    # Iterate through each part of the item
+    for (part in paragraphs[[name]]) {
+      matches <- regmatches(part, gregexpr(pattern, part, ignore.case = TRUE))[[1]]
+      match_positions <- gregexpr(pattern, part, ignore.case = TRUE, perl = TRUE)[[1]]
+      if (length(matches) == 0) {
+        next
+      }
+      match_lengths <- attr(match_positions, "match.length")
+
+      contexts <- c(rep(NA, length(matches)))
+      multi_p_sentences <- c()
+      for (i in seq_along(match_positions)) {
+        sentence_checked <- FALSE
+        brackets_processed <- FALSE
+        match_start <- match_positions[i]
+        match_end <- match_start + match_lengths[i] - 1
+
+        # Extract everything following the p-value until the first non-number character
+        post_match <- substr(part, match_end + 1, nchar(part))
+        post_match <- sub("^[0-9a-zA-Z]+", "", post_match)
+        first_non_num_char <- substr(post_match, 1, 1)
+        while (first_non_num_char %in% c(" ", ",", "=") || grepl("^[0-9.]+$", substr(post_match, 2, 2)) && first_non_num_char != ")") {
+          post_match <- substr(post_match, 2, nchar(post_match))
+          post_match <- sub("^[0-9a-zA-Z]+", "", post_match)
+          first_non_num_char <- substr(post_match, 1, 1)
+        }
+        if (first_non_num_char == "(") {
+          first_non_num_char <- "\\("
+        }
+        # find position of first_non_num_char in part
+        first_non_num_char_pos <- gregexpr(first_non_num_char, substr(part, match_end, nchar(part)), ignore.case = TRUE)[[1]]
+        if (first_non_num_char == ".") {
+          match_end <- (match_end + first_non_num_char_pos[[1]][1]) - 1
+        } else if (first_non_num_char == "\\(") {
+          match_end <- match_end
+        } else {
+          match_end <- (match_end + first_non_num_char_pos[[1]][1]) - 2
+        }
+        current_match <- substr(part, match_start, match_end)
+        # print(current_match)
+        context <- ""
+        if (first_non_num_char == ")") {
+          # Counting parentheses
+          count <- 0
+          for (j in (match_end):1) {
+            # print(substr(part, j, j))
+            if (substr(part, j, j) == "*") {
+              brackets_processed <- TRUE
+              context <- paste0("likely false extraction: ", current_match)
+              break
+            } else if (substr(part, j, j) == ";") {
+              context <- substr(part, j, match_end)
+              break
+            } else if (substr(part, j, j) == ")") {
+              count <- count + 1
+            } else if (substr(part, j, j) == "(") {
+              count <- count - 1
+              if (count < 0) {
+                if(j <= match_start){
+                  context <- substr(part, j, match_end)
+                  if(substr(part, j, j) == "("){
+                    context <- substr(part, j-1, match_end)
+                    if(substr(context, 1, 1) %in% c("F", "t", "z")){
+                      context <- context
+                    } else {
+                      context <- substr(part, j+1, match_end)
+                    }
+                  }
+                  brackets_processed <- TRUE
+                  break
+                }
+              }
+            }
+          }
+          contexts[i] <- context
+        } else if (first_non_num_char == ";") {
+          # Counting parentheses
+          count <- 0
+          for (j in (match_end):1) {
+            # print(substr(part, j, j))
+            if (substr(part, j, j) == "*") {
+              context <- paste0("likely false extraction: ", current_match)
+              break
+            } else if (substr(part, j, j) == ")") {
+              count <- count + 1
+            } else if (substr(part, j, j) == "(") {
+              count <- count - 1
+              if (count < 0) {
+                context <- substr(part, j, match_end)
+                break
+              }
+            } else if (substr(part, j, j) == ";") {
+              context <- substr(part, j, match_end)
+              break
+            }
+          }
+          contexts[i] <- substr(context, 2, nchar(context))
+        } else if (first_non_num_char == "\\(" && brackets_processed == FALSE) { 
+          # Split the text by spaces and reverse the order
+          words <- strsplit(substr(part, 1, match_end), " ")[[1]]
+          words <- rev(words)
+
+          # Initialize context and a flag to identify when to stop
+          context <- ""
+          stop_extracting <- FALSE
+
+          for (word in words) {
+            if (!stop_extracting) {
+              if (grepl("^[a-zA-Z]{3,}$", word)) {
+                # Stop extracting if the word has more than 2 letters
+                stop_extracting <- TRUE
+              } else {
+                # Append the word to the context
+                context <- paste(word, context)
+              }
+            }
+          }
+
+          # Trim leading and trailing spaces
+          context <- gsub("^\\s+|\\s+$", "", context)
+          contexts[i] <- context
+        } else if (first_non_num_char == ".") {
+          # search for first "." before that in the text that is followed by a space
+          sentence_start_pattern <- "\\.\\s" 
+          sentence_match_positions <- gregexpr(sentence_start_pattern, substr(part, 1, match_start), ignore.case = TRUE)[[1]]
+          sentence_start <- sentence_match_positions[length(sentence_match_positions)]
+          sentence <- substr(part, sentence_start, match_end)
+          for (j in (match_start):sentence_start) {
+            if (substr(part, j, j) == "(" || substr(part, j, j) == ";") {
+                context <- substr(part, j-1, match_end)
+                break
+            } else if(j == sentence_start){
+              context <- substr(part, j, match_end)
+              # check if there are multiple p_values in context
+              if(length(regmatches(context, gregexpr(pattern, context, ignore.case = TRUE))[[1]]) > 1){
+                # extract everything backwards until last p-value
+
+               if(!(context %in% multi_p_sentences)){
+                  multi_p_sentences <- rbind(multi_p_sentences, c(context, 1))
+                } else {
+                  multi_p_sentences[which(multi_p_sentences[,1] == context), 2] <- as.numeric(multi_p_sentences[which(multi_p_sentences[,1] == context), 2]) + 1
+                }
+                p_in_sentence <- as.numeric(multi_p_sentences[which(multi_p_sentences[,1] == context), 2])
+                context_matches <- regmatches(context, gregexpr(pattern, context, ignore.case = TRUE))[[1]]
+                context_match_positions <- gregexpr(pattern, context, ignore.case = TRUE, perl = TRUE)[[1]]
+                context_match_lengths <- attr(context_match_positions, "match.length")
+                if(p_in_sentence == 1){
+                  context <- substr(context, 1, context_match_positions[p_in_sentence]+context_match_lengths[p_in_sentence])
+                } else {
+                  context <- substr(context, context_match_positions[p_in_sentence-1]+context_match_lengths[p_in_sentence-1], context_match_positions[p_in_sentence]+context_match_lengths[p_in_sentence])
+                }
+              }
+              sentence_checked <- TRUE
+              break
+            }
+          }
+          contexts[i] <- context
+        } else {
+          for (j in (match_end):1) {
+            if (substr(part, j, j) == "*") {
+              context <- paste0("likely false extraction: ", current_match)
+              break
+            } else if (substr(part, j, j) == ".") {
+              context <- current_match
+            }
+          }
+          contexts[i] <- context
+        }
+        # check if there are multiple p-values in the context
+        if(length(regmatches(context, gregexpr(pattern, context, ignore.case = TRUE))[[1]]) > 1 && !sentence_checked){
+          # extract everything backwards until last p-value
+          if(!(context %in% multi_p_sentences)){
+            multi_p_sentences <- rbind(multi_p_sentences, c(context, 1))
+          } else {
+            multi_p_sentences[which(multi_p_sentences[,1] == context), 2] <- as.numeric(multi_p_sentences[which(multi_p_sentences[,1] == context), 2]) + 1
+          }
+          p_in_sentence <- as.numeric(multi_p_sentences[which(multi_p_sentences[,1] == context), 2])
+          context_matches <- regmatches(context, gregexpr(pattern, context, ignore.case = TRUE))[[1]]
+          context_match_positions <- gregexpr(pattern, context, ignore.case = TRUE, perl = TRUE)[[1]]
+          context_match_lengths <- attr(context_match_positions, "match.length")
+          if(p_in_sentence == 1){
+            context <- substr(context, 1, context_match_positions[p_in_sentence]+context_match_lengths[p_in_sentence])
+          } else {
+            context <- substr(context, context_match_positions[p_in_sentence-1]+context_match_lengths[p_in_sentence-1], context_match_positions[p_in_sentence]+context_match_lengths[p_in_sentence])
+          }
+
+          contexts[i] <- context
+        }
+
+        if(contexts[i] %in% c("n.s", "n.s.")){
+          # extract everything backwards until ( or ;
+          for (j in (match_start):1) {
+            if (substr(part, j, j) == "(" || substr(part, j, j) == ";") {
+                context <- substr(part, j, match_end)
+                break
+            } else if(j < match_start-50){
+              context <- substr(part, j, match_end)
+              break
+            }
+          }
+          contexts[i] <- context
+        }
+      }
+      raw_matches[[name]] <- c(raw_matches[[name]], matches)
+      extracted_p_values_with_context[[name]] <- c(extracted_p_values_with_context[[name]], contexts)
+    }
+  }
+
+  return(list(extracted_p_values_with_context, raw_matches))
+}
+```
+
+# Extract Tests
+
+The function takes a list of files and their path as input and returns a list of extracted p-values with their context.
+It specifically looks for p-values close to words like "hypothesis", "prediction", "predicted", or "anticipated".
+It then extracts the p-values by looking for patterns like "p = 0.05" or "p < 0.01" and extracts the context around the p-value.
+The context is defined as the text surrounding the p-value that provides additional test statistics.
+
+```{r}
+extract_tests <- function(path, files, select_results_only = FALSE) {
+  # create empty data frame
+  df <- data.frame()
+  # iterate through files
+  for (file in files) {
+    # Load the XML file
+    xml_content <- xmlParse(file)
+    # Define the namespace
+    namespaces <- c(tei = "http://www.tei-c.org/ns/1.0")
+    # Initialize variables for grouping
+    grouped_paragraphs <- list()
+
+
+    current_head <- ""
+    parent_head <- "INTRODUCTION_"
+    # Iterate through <div> elements
+    divs <- getNodeSet(xml_content, "//tei:body/tei:div", namespaces)
+    for (div in divs) {
+      # Check for a <head> tag within the <div>
+      head_node <- getNodeSet(div, "tei:head", namespaces)
+      head_text <- ""
+      if (length(head_node) > 0) {
+        head_text <- xmlValue(head_node[[1]])
+        if (grepl("methods", head_text, ignore.case = TRUE)) {
+          parent_head <- "METHODS_"
+        } else if (grepl("results", head_text, ignore.case = TRUE) || grepl("findings", head_text, ignore.case = TRUE)) {
+          parent_head <- "RESULTS_"
+        } else if (tolower(head_text) == "discussion") {
+          parent_head <- "DISCUSSION_"
+        } else if (grepl("conclusion", head_text, ignore.case = TRUE)) {
+          parent_head <- "CONCLUSION_"
+        }
+      }
+      # Unique identifier for each head
+      current_head <- paste(parent_head, head_text, sum(names(grouped_paragraphs) == head_text) + 1, sep = "_")#
+      # Extract <p> tags within the <div>
+      paragraphs <- getNodeSet(div, "tei:p", namespaces)
+      for (p in paragraphs) {
+        paragraph_text <- extract_text(p)
+        grouped_paragraphs[[current_head]] <- c(grouped_paragraphs[[current_head]], paragraph_text)
+      }
+    }
+    # Apply this function to the extracted text
+    grouped_paragraphs <- lapply(grouped_paragraphs, replace_characters)
+    # Filter sections with "result" in the header
+    if (select_results_only == TRUE) {
+      result_sections <- list()
+      for (name in names(grouped_paragraphs)) {
+        if (grepl("result", name, ignore.case = TRUE)) {
+          result_sections[[name]] <- grouped_paragraphs[[name]]
+        }
+      }
+    } else {
+      result_sections <- grouped_paragraphs
+    }
+
+    # Within each "result" section, select paragraphs containing the specified patterns
+    # Patterns to search for to filter out paragraphs that discuss hypotheses / predictions
+    patterns <- c("hypothes", "prediction", "predicted", "anticipated")
+    selected_paragraphs <- list()
+    for (name in names(result_sections)) {
+      paragraphs <- result_sections[[name]]
+      selected_paragraphs[[name]] <- Filter(function(paragraph) contains_patterns(paragraph, patterns), paragraphs)
+    }
+    # Apply the function to your selected_paragraphs list
+    extracted_p_values_contexts <- extract_p_values_with_context(selected_paragraphs)
+    # check if no p-values were found
+    if (all(sapply(unlist(extracted_p_values_contexts[[1]]), is.null))) {
+      extracted_p_values_contexts[[1]] <- list("no p-values found; paper might be qualitative?")
+      extracted_p_values_contexts[[2]] <- list("no p-values found; paper might be qualitative?")
+    }
+    # create data frame with file name and p-values
+    df <- rbind(df, data.frame(file = file, test_report = unlist(extracted_p_values_contexts[[1]]), p_value = unlist(extracted_p_values_contexts[[2]])))
+  }
+  df$p_value_reporting <- ifelse(grepl("=", df$p_value), "exact", "limit")
+  df$p_value_num <- suppressWarnings(as.numeric(gsub("p[_[:alnum:]]* *[<>=] *", "", df$p_value)))
+  return(df)
+}
+```
+
+# Calculate Exact P-Value 
+
+This function calculates the exact p-value for values that are reported as "limit" in the extracted data, and that have the respective test report to make this possible.
+
+```{r}
+#' Calculate Exact P-Value
+#'
+#' This function calculates the exact p-value for each row in the extracted_data dataframe.
+#' It checks if the p-value reporting is "limit" and then calculates the p-value based on the test report.
+#' If the test report contains a t-statistic with degrees of freedom (df), it calculates the p-value using the t-distribution.
+#' If the test report contains an F-statistic with two sets of degrees of freedom (df1, df2), it calculates the p-value using the F-distribution.
+#'
+#' @param extracted_data A dataframe containing the extracted data.
+#'
+#' @return The extracted_data dataframe with the calculated p-values and updated p-value reporting.
+#'
+#' @examples
+#' data <- data.frame(p_value_reporting = c("limit", "limit"),
+#'                    test_report = c("t(10) = -2.34", "F(5, 10) = 3.45"))
+#' calculate_exact_p(data)
+#'
+#' @export
+calculate_exact_p <- function(extracted_data) {
+  extracted_data$p_value_calc <- NA
+  for (i in 1:nrow(extracted_data)) {
+    row <- extracted_data[i, ]
+    if (row$p_value_reporting == "limit") {
+      test_report <- row$test_report
+      # Check and extract for z-values (both lowercase and uppercase) reported with s.e.
+      if (grepl("z\\s*=\\s*-?\\d*\\.?\\d+", test_report, ignore.case = TRUE)) {
+        reg_match <- "z\\s*=\\s*(-?\\d*\\.?\\d+)"
+        matches <- regmatches(test_report, regexec(reg_match, test_report, ignore.case = TRUE))
+        if (length(matches[[1]]) > 0) {
+          z_value <- as.numeric(matches[[1]][2])
+          p_value <- 2 * pnorm(-abs(z_value))
+          p_value <- as.numeric(format(p_value, scientific = TRUE))
+
+
+          # check if first digit of t-value is a 2
+          if (!(is.na(extracted_data$p_value_num[i]))) {
+            if (substr(z_value, 1, 1) == "2") {
+              if (nchar(z_value) == 1) {
+                z_value <- paste0(z_value, ".0")
+              }
+              z_value_new <- as.numeric(substr(z_value, 2, nchar(z_value)))
+              p_value_new <- 2 * pnorm(-abs(z_value_new))
+              # select p_value_new or p_value according to which one minimizes difference to extracted_data$p_value_num[i]
+              p_value <- ifelse(abs(p_value_new - extracted_data$p_value_num[i]) < abs(p_value - extracted_data$p_value_num[i]), p_value_new, p_value)
+            }
+          } else {
+            if (substr(z_value, 1, 1) == "2") {
+              if (nchar(z_value) == 1) {
+                z_value <- paste0(z_value, ".0")
+              }
+              z_value_new <- as.numeric(substr(z_value, 2, nchar(z_value)))
+              p_value_new <- 2 * pnorm(-abs(z_value_new))
+              # select p_value_new or p_value according to which one minimizes difference to extracted_data$p_value_num[i]
+              p_value <- max(p_value_new, p_value)
+            }
+          }
+          extracted_data$p_value_calc[i] <- p_value
+          extracted_data$p_value_reporting[i] <- "calc_from_z"
+          next
+        }
+      }
+      # check for t-statistic with df
+      if (grepl("(t|i)\\(\\d+\\)\\s*=\\s*-?\\d+\\.?\\d*", test_report)) {
+        reg_match <- "(t|i)\\((\\d+)\\)\\s*=\\s*(-?\\d+\\.?\\d*)"
+        matches <- regmatches(test_report, regexec(reg_match, test_report))
+        df <- as.numeric(matches[[1]][3])
+        t_value <- as.numeric(matches[[1]][4])
+        p_value <- 2 * pt(-abs(t_value), df)
+        p_value <- as.numeric(format(p_value, scientific = TRUE))
+
+        if (!(is.na(extracted_data$p_value_num[i]))) {
+          if (substr(t_value, 1, 1) == "2") {
+            if (nchar(t_value) == 1) {
+              t_value <- paste0(t_value, ".0")
+            }
+            t_value_new <- substr(t_value, 2, nchar(t_value))
+            p_value_new <- 2 * pt(-abs(as.numeric(t_value_new)), df)
+            # select p_value_new or p_value according to which one minimizes difference to extracted_data$p_value_num[i]
+            p_value <- ifelse(abs(p_value_new - extracted_data$p_value_num[i]) < abs(p_value - extracted_data$p_value_num[i]), p_value_new, p_value)
+          }
+        } else {
+          if (substr(t_value, 1, 1) == "2") {
+            if (nchar(t_value) == 1) {
+              t_value <- paste0(t_value, ".0")
+            }
+            t_value_new <- substr(t_value, 2, nchar(t_value))
+            p_value_new <- 2 * pt(-abs(as.numeric(t_value_new)), df)
+            # select p_value_new or p_value according to which one minimizes difference to extracted_data$p_value_num[i]
+            p_value <- max(p_value_new, p_value)
+          }
+        }
+        extracted_data$p_value_calc[i] <- p_value
+        extracted_data$p_value_reporting[i] <- "calc_from_t"
+        next
+      }
+      # check for t-statistic with df where a number in the bracket is l or I accidentally
+      if (grepl("i(l", test_report, fixed = TRUE) || grepl("i(I", test_report, fixed = TRUE) || grepl("t(l", test_report, fixed = TRUE) || grepl("t(I", test_report, fixed = TRUE)) {
+        test_report_split <- strsplit(test_report, " ")[[1]]
+        if (test_report_split[1] == ";") {
+          si <- 1
+        } else {
+          si <- 0
+        }
+        df_split <- strsplit(test_report_split[1 + si], split = "\\(")[[1]]
+        df <- gsub("[Il]", "1", df_split[2])
+        df <- as.numeric(gsub(")", "", df))
+        if (is.na(df)) {
+          extracted_data$p_value_calc[i] <- "no_df_found"
+          next
+        }
+
+        t_value <- test_report_split[3 + si]
+        t_value <- as.numeric(gsub(",", "", t_value))
+
+        p_value <- 2 * pt(-abs(t_value), df)
+        p_value <- as.numeric(format(p_value, scientific = TRUE))
+
+        if (!(is.na(extracted_data$p_value_num[i]))) {
+          if (substr(t_value, 1, 1) == "2") {
+            if (nchar(t_value) == 1) {
+              t_value <- paste0(t_value, ".0")
+            }
+            t_value_new <- substr(t_value, 2, nchar(t_value))
+            p_value_new <- 2 * pt(-abs(as.numeric(t_value_new)), df)
+            # select p_value_new or p_value according to which one minimizes difference to extracted_data$p_value_num[i]
+            p_value <- ifelse(abs(p_value_new - extracted_data$p_value_num[i]) < abs(p_value - extracted_data$p_value_num[i]), p_value_new, p_value)
+          }
+        } else {
+          if (substr(t_value, 1, 1) == "2") {
+            if (nchar(t_value) == 1) {
+              t_value <- paste0(t_value, ".0")
+            }
+            t_value_new <- substr(t_value, 2, nchar(t_value))
+            p_value_new <- 2 * pt(-abs(as.numeric(t_value_new)), df)
+            # select p_value_new or p_value according to which one minimizes difference to extracted_data$p_value_num[i]
+            p_value <- max(p_value_new, p_value)
+          }
+        }
+        extracted_data$p_value_calc[i] <- p_value
+        extracted_data$p_value_reporting[i] <- "calc_from_t"
+        next
+      }
+      # additional matching of t values where the brackets are missing
+      if (grepl("[tiT]\\s*\\d*\\.?\\d*\\s+5", test_report)) {
+        test_report_split <- strsplit(test_report, split = " ")[[1]]
+        if (test_report_split[1] == ";") {
+          si <- 1
+        } else {
+          si <- 0
+        }
+        t_value <- as.numeric(gsub("[^0-9.-]", "", test_report_split[4 + si]))
+        df <- as.numeric(gsub("[^0-9.-]", "", test_report_split[2 + si]))
+        p_value <- 2 * pt(-abs(t_value), df)
+        p_value <- as.numeric(format(p_value, scientific = TRUE))
+        # check if first digit of t-value is a 2
+        if (!(is.na(extracted_data$p_value_num[i]))) {
+          if (substr(t_value, 1, 1) == "2") {
+            if (nchar(t_value) == 1) {
+              t_value <- paste0(t_value, ".0")
+            }
+            t_value_new <- substr(t_value, 2, nchar(t_value))
+            p_value_new <- 2 * pt(-abs(as.numeric(t_value_new)), df)
+            # select p_value_new or p_value according to which one minimizes difference to extracted_data$p_value_num[i]
+            p_value <- ifelse(abs(p_value_new - extracted_data$p_value_num[i]) < abs(p_value - extracted_data$p_value_num[i]), p_value_new, p_value)
+          }
+        } else {
+          if (substr(t_value, 1, 1) == "2") {
+            if (nchar(t_value) == 1) {
+              t_value <- paste0(t_value, ".0")
+            }
+            t_value_new <- substr(t_value, 2, nchar(t_value))
+            p_value_new <- 2 * pt(-abs(as.numeric(t_value_new)), df)
+            # select p_value_new or p_value according to which one minimizes difference to extracted_data$p_value_num[i]
+            p_value <- max(p_value_new, p_value)
+          }
+        }
+        extracted_data$p_value_calc[i] <- p_value
+        extracted_data$p_value_reporting[i] <- "calc_from_t"
+        next
+      }
+
+      if (grepl("F\\(([1Il]),\\s*(\\d{1,3}(,\\d{3})*)\\)\\s*=\\s*(-?\\d+\\.?\\d*)", test_report)) {
+        reg_match <- "F\\(([1Il]),\\s*(\\d{1,3}(,\\d{3})*)\\)\\s*=\\s*(-?\\d+\\.?\\d*)"
+        matches <- regmatches(test_report, regexec(reg_match, test_report))
+
+        if (length(matches[[1]]) > 1) {
+          # Convert possible variations of "1" to the digit 1
+          df1 <- as.numeric(gsub("[Il]", "1", matches[[1]][2]))
+          df2 <- as.numeric(gsub(",", "", matches[[1]][3]))
+          f_value <- ifelse("," %in% strsplit(matches[[1]][3], "")[[1]], as.numeric(matches[[1]][5]), as.numeric(matches[[1]][4]))
+          if (is.na(f_value)) {
+            f_value <- as.numeric(matches[[1]][5])
+          }
+
+          p_value <- pf(f_value, df1, df2, lower.tail = FALSE)
+          p_value <- as.numeric(format(p_value, scientific = TRUE))
+
+          # check if first digit of t-value is a 2
+          if (!(is.na(extracted_data$p_value_num[i]))) {
+            if (substr(f_value, 1, 1) == "2") {
+              if (nchar(f_value) == 1) {
+                f_value <- paste0(f_value, ".0")
+              }
+              f_value_new <- as.numeric(substr(f_value, 2, nchar(f_value)))
+              p_value_new <- pf(f_value, df1, df2, lower.tail = FALSE)
+              # select p_value_new or p_value according to which one minimizes difference to extracted_data$p_value_num[i]
+              p_value <- ifelse(abs(p_value_new - extracted_data$p_value_num[i]) < abs(p_value - extracted_data$p_value_num[i]), p_value_new, p_value)
+            }
+          } else {
+            if (substr(f_value, 1, 1) == "2") {
+              if (nchar(f_value) == 1) {
+                f_value <- paste0(f_value, ".0")
+              }
+              f_value_new <- as.numeric(substr(f_value, 2, nchar(f_value)))
+              p_value_new <- pf(f_value, df1, df2, lower.tail = FALSE)
+              # select p_value_new or p_value according to which one minimizes difference to extracted_data$p_value_num[i]
+              p_value <- max(p_value_new, p_value)
+            }
+          }
+          extracted_data$p_value_calc[i] <- p_value
+          extracted_data$p_value_reporting[i] <- "calc_from_f"
+          next
+        }
+      }
+
+      if (grepl("F\\s*\\d+[,\\.]\\d+\\s*5", test_report)) {
+        test_report_split <- strsplit(test_report, split = " ")[[1]]
+        if (test_report_split[1] == ";") {
+          si <- 1
+        } else {
+          si <- 0
+        }
+        f_value <- as.numeric(gsub("[^0-9.-]", "", test_report_split[4 + si]))
+        df1 <- as.numeric(strsplit(test_report_split[2 + si], split = ",")[[1]][1])
+        df2 <- as.numeric(strsplit(test_report_split[2 + si], split = ",")[[1]][2])
+        p_value <- pf(f_value, df1, df2, lower.tail = FALSE)
+        p_value <- as.numeric(format(p_value, scientific = TRUE))
+
+        # check if first digit of t-value is a 2
+        if (!(is.na(extracted_data$p_value_num[i]))) {
+          if (substr(f_value, 1, 1) == "2") {
+            if (nchar(f_value) == 1) {
+              f_value <- paste0(f_value, ".0")
+            }
+            f_value_new <- as.numeric(substr(f_value, 2, nchar(f_value)))
+            p_value_new <- pf(f_value, df1, df2, lower.tail = FALSE)
+            # select p_value_new or p_value according to which one minimizes difference to extracted_data$p_value_num[i]
+            p_value <- ifelse(abs(p_value_new - extracted_data$p_value_num[i]) < abs(p_value - extracted_data$p_value_num[i]), p_value_new, p_value)
+          }
+        } else {
+          if (substr(f_value, 1, 1) == "2") {
+            if (nchar(f_value) == 1) {
+              f_value <- paste0(f_value, ".0")
+            }
+            f_value_new <- as.numeric(substr(f_value, 2, nchar(f_value)))
+            p_value_new <- pf(f_value, df1, df2, lower.tail = FALSE)
+            # select p_value_new or p_value according to which one minimizes difference to extracted_data$p_value_num[i]
+            p_value <- max(p_value_new, p_value)
+          }
+        }
+        extracted_data$p_value_calc[i] <- p_value
+        extracted_data$p_value_reporting[i] <- "calc_from_f"
+        next
+      }
+      # Check and extract for beta
+      if (grepl("β\\s*=\\s*(-?\\d*\\.?\\d+)\\s*(\\(s\\.e\\.\\s*=\\s*(-?\\d*\\.?\\d+)\\)|,\\s*s\\.e\\.\\s*=\\s*(-?\\d*\\.?\\d+))", test_report)) {
+        reg_match <- "β\\s*=\\s*(-?\\d*\\.?\\d+)\\s*(\\(s\\.e\\.\\s*=\\s*(-?\\d*\\.?\\d+)\\)|,\\s*s\\.e\\.\\s*=\\s*(-?\\d*\\.?\\d+))"
+        matches <- regmatches(test_report, regexec(reg_match, test_report))
+        beta_value <- as.numeric(matches[[1]][2])
+        se_value <- ifelse(!is.na(matches[[1]][4]), as.numeric(matches[[1]][4]), as.numeric(matches[[1]][5]))
+        z_value <- beta_value / se_value
+        p_value <- 2 * pnorm(-abs(z_value))
+        p_value <- as.numeric(format(p_value, scientific = TRUE))
+
+
+        # check if first digit of t-value is a 2
+        if (!(is.na(extracted_data$p_value_num[i]))) {
+          if (substr(beta_value, 1, 1) == "2") {
+            if (nchar(beta_value) == 1) {
+              beta_value <- paste0(beta_value, ".0")
+            }
+            beta_value_new <- as.numeric(substr(beta_value, 2, nchar(beta_value)))
+            z_value_new <- beta_value_new / se_value
+            p_value_new <- 2 * pnorm(-abs(z_value_new))
+            # select p_value_new or p_value according to which one minimizes difference to extracted_data$p_value_num[i]
+            p_value <- ifelse(abs(p_value_new - extracted_data$p_value_num[i]) < abs(p_value - extracted_data$p_value_num[i]), p_value_new, p_value)
+          }
+        } else {
+          if (nchar(beta_value) == 1) {
+            beta_value <- paste0(beta_value, ".0")
+          }
+          if (substr(beta_value, 1, 1) == "2") {
+            beta_value_new <- as.numeric(substr(beta_value, 2, nchar(beta_value)))
+            z_value_new <- beta_value_new / se_value
+            p_value_new <- 2 * pnorm(-abs(z_value_new))
+            # select p_value_new or p_value according to which one minimizes difference to extracted_data$p_value_num[i]
+            p_value <- max(p_value_new, p_value)
+          }
+        }
+        extracted_data$p_value_calc[i] <- p_value
+        extracted_data$p_value_reporting[i] <- "calc_from_beta"
+        next
+      }
+
+
+      if (grepl("b\\s*=\\s*(-?\\d*\\.?\\d+)\\s*(\\(s\\.e\\.\\s*=\\s*(-?\\d*\\.?\\d+)\\)|,\\s*s\\.e\\.\\s*=\\s*(-?\\d*\\.?\\d+)|,\\s*se\\s*=\\s*(-?\\d*\\.?\\d+))", test_report, ignore.case = TRUE)) {
+        reg_match <- "b\\s*=\\s*(-?\\d*\\.?\\d+)\\s*(\\(s\\.e\\.\\s*=\\s*(-?\\d*\\.?\\d+)\\)|,\\s*s\\.e\\.\\s*=\\s*(-?\\d*\\.?\\d+)|,\\s*se\\s*=\\s*(-?\\d*\\.?\\d+))"
+        matches <- regmatches(test_report, regexec(reg_match, test_report, ignore.case = TRUE))
+        b_value <- as.numeric(matches[[1]][2])
+        se_value <- ifelse(!nchar(matches[[1]][4]) == 0, as.numeric(matches[[1]][4]), as.numeric(matches[[1]][5]))
+        se_value <- ifelse(is.na(se_value), as.numeric(matches[[1]][6]), se_value)
+        z_value <- b_value / se_value
+        p_value <- 2 * pnorm(-abs(z_value))
+        p_value <- as.numeric(format(p_value, scientific = TRUE))
+        # check if first digit of t-value is a 2
+        if (!(is.na(extracted_data$p_value_num[i]))) {
+          if (substr(b_value, 1, 1) == "2") {
+            if (nchar(b_value) == 1) {
+              b_value <- paste0(b_value, ".0")
+            }
+            b_value_new <- as.numeric(substr(b_value, 2, nchar(b_value)))
+            z_value_new <- b_value_new / se_value
+            p_value_new <- 2 * pnorm(-abs(z_value_new))
+            # select p_value_new or p_value according to which one minimizes difference to extracted_data$p_value_num[i]
+            p_value <- ifelse(abs(p_value_new - extracted_data$p_value_num[i]) < abs(p_value - extracted_data$p_value_num[i]), p_value_new, p_value)
+          }
+        } else {
+          if (substr(b_value, 1, 1) == "2") {
+            if (nchar(b_value) == 1) {
+              b_value <- paste0(b_value, ".0")
+            }
+            b_value_new <- as.numeric(substr(b_value, 2, nchar(b_value)))
+            z_value_new <- b_value_new / se_value
+            p_value_new <- 2 * pnorm(-abs(z_value_new))
+            # select p_value_new or p_value according to which one minimizes difference to extracted_data$p_value_num[i]
+            p_value <- max(p_value_new, p_value)
+          }
+        }
+        extracted_data$p_value_calc[i] <- p_value
+        extracted_data$p_value_reporting[i] <- "calc_from_b"
+        next
+      }
+      # Check and extract for gamma
+      if (grepl("γ\\s*=\\s*(-?\\d*\\.?\\d+)\\s*(\\(s\\.e\\.\\s*=\\s*(-?\\d*\\.?\\d+)\\)|,\\s*s\\.e\\.\\s*=\\s*(-?\\d*\\.?\\d+))", test_report)) {
+        reg_match <- "γ\\s*=\\s*(-?\\d*\\.?\\d+)\\s*(\\(s\\.e\\.\\s*=\\s*(-?\\d*\\.?\\d+)\\)|,\\s*s\\.e\\.\\s*=\\s*(-?\\d*\\.?\\d+))"
+        matches <- regmatches(test_report, regexec(reg_match, test_report))
+        gamma_value <- as.numeric(matches[[1]][2])
+        se_value <- ifelse(!is.na(matches[[1]][4]), as.numeric(matches[[1]][4]), as.numeric(matches[[1]][5]))
+        if (is.na(se_value)) {
+          se_value <- ifelse(nchar(matches[[1]][4]) == 0, as.numeric(matches[[1]][5]), as.numeric(matches[[1]][4]))
+        }
+        z_value <- gamma_value / se_value
+        p_value <- 2 * pnorm(-abs(z_value))
+        p_value <- as.numeric(format(p_value, scientific = TRUE))
+
+        # check if first digit of t-value is a 2
+        if (!(is.na(extracted_data$p_value_num[i]))) {
+          if (substr(gamma_value, 1, 1) == "2") {
+            if (nchar(gamma_value) == 1) {
+              gamma_value <- paste0(gamma_value, ".0")
+            }
+            gamma_value_new <- as.numeric(substr(gamma_value, 2, nchar(gamma_value)))
+            z_value_new <- gamma_value_new / se_value
+            p_value_new <- 2 * pnorm(-abs(z_value_new))
+            # select p_value_new or p_value according to which one minimizes difference to extracted_data$p_value_num[i]
+            p_value <- ifelse(abs(p_value_new - extracted_data$p_value_num[i]) < abs(p_value - extracted_data$p_value_num[i]), p_value_new, p_value)
+          }
+        } else {
+          if (substr(gamma_value, 1, 1) == "2") {
+            if (nchar(gamma_value) == 1) {
+              gamma_value <- paste0(gamma_value, ".0")
+            }
+            gamma_value_new <- as.numeric(substr(gamma_value, 2, nchar(gamma_value)))
+            z_value_new <- beta_value_new / se_value
+            p_value_new <- 2 * pnorm(-abs(z_value_new))
+            # select p_value_new or p_value according to which one minimizes difference to extracted_data$p_value_num[i]
+            p_value <- max(p_value_new, p_value)
+          }
+        }
+        extracted_data$p_value_calc[i] <- p_value
+        extracted_data$p_value_reporting[i] <- "calc_from_gamma"
+        next
+      }
+      # Check and extract for chi-squared values while excluding "R 2"
+      if (grepl("(?<!R\\s)(Δ\\s*χ2|Δ\\s*X2|χ2|X2|\\b2(?=\\s))\\s*(?:\\(\\d+\\))?\\s*=\\s*-?\\d+\\.?\\d*(?:,\\s*Δ?df\\s*=\\s*\\d+)?", test_report, perl = TRUE)) {
+        reg_match <- "(?<!R\\s)(Δ\\s*χ2|Δ\\s*X2|χ2|X2|\\b2(?=\\s))\\s*(?:\\((\\d+)\\))?\\s*=\\s*(-?\\d+\\.?\\d*)(?:,\\s*Δ?df\\s*=\\s*(\\d+))?"
+        matches <- regmatches(test_report, regexec(reg_match, test_report, perl = TRUE))
+        if (nchar(matches[[1]][3]) == 0) {
+          chi_sq_index <- 4
+          df_index <- 5
+        } else {
+          chi_sq_index <- 4
+          df_index <- 3
+        }
+        if (length(matches[[1]]) > 0) {
+          chi_squared_value <- as.numeric(matches[[1]][chi_sq_index])
+          df_value <- as.numeric(matches[[1]][df_index])
+          if (is.na(df_value)) {
+            extracted_data$p_value_calc[i] <- "no df found"
+            next
+          }
+          p_value <- pchisq(chi_squared_value, df_value, lower.tail = FALSE)
+          p_value <- as.numeric(format(p_value, scientific = TRUE))
+
+          # check if first digit of t-value is a 2
+          if (!(is.na(extracted_data$p_value_num[i]))) {
+            if (substr(chi_squared_value, 1, 1) == "2") {
+              if (nchar(chi_squared_value) == 1) {
+                chi_squared_value <- paste0(chi_squared_value, ".0")
+              }
+              chi_squared_value_new <- as.numeric(substr(chi_squared_value, 2, nchar(chi_squared_value)))
+              p_value_new <- pchisq(chi_squared_value_new, df_value, lower.tail = FALSE)
+              # select p_value_new or p_value according to which one minimizes difference to extracted_data$p_value_num[i]
+              p_value <- ifelse(abs(p_value_new - extracted_data$p_value_num[i]) < abs(p_value - extracted_data$p_value_num[i]), p_value_new, p_value)
+            }
+          } else {
+            if (substr(chi_squared_value, 1, 1) == "2") {
+              if (nchar(chi_squared_value) == 1) {
+                chi_squared_value <- paste0(chi_squared_value, ".0")
+              }
+              chi_squared_value_new <- as.numeric(substr(chi_squared_value_new, 2, nchar(chi_squared_value_new)))
+              p_value_new <- pchisq(chi_squared_value_new, df_value, lower.tail = FALSE)
+              # select p_value_new or p_value according to which one minimizes difference to extracted_data$p_value_num[i]
+              p_value <- max(p_value_new, p_value)
+            }
+          }
+          extracted_data$p_value_calc[i] <- p_value
+          extracted_data$p_value_reporting[i] <- "calc_from_chi_squared"
+          next
+        }
+      }
+      # Additional check and extract for chi-squared values with different formats
+      if (grepl("(?<!R\\s)(D\\s*x2|x2)\\s*\\(\\d+\\)\\s*=\\s*-?\\d+\\.?\\d*", test_report, perl = TRUE)) {
+        reg_match <- "(?<!R\\s)(D\\s*x2|x2)\\s*\\((\\d+)\\)\\s*=\\s*(-?\\d+\\.?\\d*)"
+        matches <- regmatches(test_report, regexec(reg_match, test_report, perl = TRUE))
+        if (length(matches[[1]]) > 0) {
+          chi_squared_value <- as.numeric(matches[[1]][4])
+          df_value <- as.numeric(matches[[1]][3])
+          p_value <- pchisq(chi_squared_value, df_value, lower.tail = FALSE)
+          p_value <- as.numeric(format(p_value, scientific = TRUE))
+
+          # check if first digit of t-value is a 2
+          if (!(is.na(extracted_data$p_value_num[i]))) {
+            if (substr(chi_squared_value, 1, 1) == "2") {
+              if (nchar(chi_squared_value) == 1) {
+                chi_squared_value <- paste0(chi_squared_value, ".0")
+              }
+              chi_squared_value_new <- as.numeric(substr(chi_squared_value, 2, nchar(chi_squared_value)))
+              p_value_new <- pchisq(chi_squared_value_new, df_value, lower.tail = FALSE)
+              # select p_value_new or p_value according to which one minimizes difference to extracted_data$p_value_num[i]
+              p_value <- ifelse(abs(p_value_new - extracted_data$p_value_num[i]) < abs(p_value - extracted_data$p_value_num[i]), p_value_new, p_value)
+            }
+          } else {
+            if (substr(chi_squared_value, 1, 1) == "2") {
+              if (nchar(chi_squared_value) == 1) {
+                chi_squared_value <- paste0(chi_squared_value, ".0")
+              }
+              chi_squared_value_new <- as.numeric(substr(chi_squared_value_new, 2, nchar(chi_squared_value_new)))
+              p_value_new <- pchisq(chi_squared_value_new, df_value, lower.tail = FALSE)
+              # select p_value_new or p_value according to which one minimizes difference to extracted_data$p_value_num[i]
+              p_value <- max(p_value_new, p_value)
+            }
+          }
+
+          extracted_data$p_value_calc[i] <- p_value
+          extracted_data$p_value_reporting[i] <- "calc_from_chi_squared"
+          next
+        }
+      }
+      # Additional check and extract for chi-squared values in specific format
+      if (grepl("x 2", test_report)) {
+        # Find df by looking for number within brackets
+        df_match <- regmatches(test_report, regexec("x\\s*2\\s*\\((\\d+)\\)", test_report))
+        if (length(df_match[[1]]) > 0) {
+          df_value <- as.numeric(df_match[[1]][2])
+
+          # Find chi-squared value by looking for number behind first = sign
+          chi_sq_match <- regmatches(test_report, regexec("x\\s*2\\s*\\(\\d+\\)\\s*=\\s*(-?\\d*\\.?\\d+)", test_report, ignore.case = TRUE))
+
+          if (length(chi_sq_match[[1]]) > 0) {
+            chi_squared_value <- as.numeric(chi_sq_match[[1]][2])
+            p_value <- pchisq(chi_squared_value, df_value, lower.tail = FALSE)
+            p_value <- as.numeric(format(p_value, scientific = TRUE))
+
+            # check if first digit of t-value is a 2
+            if (!(is.na(extracted_data$p_value_num[i]))) {
+              if (substr(chi_squared_value, 1, 1) == "2") {
+                if (nchar(chi_squared_value) == 1) {
+                  chi_squared_value <- paste0(chi_squared_value, ".0")
+                }
+                chi_squared_value_new <- as.numeric(substr(chi_squared_value, 2, nchar(chi_squared_value)))
+                p_value_new <- pchisq(chi_squared_value_new, df_value, lower.tail = FALSE)
+                # select p_value_new or p_value according to which one minimizes difference to extracted_data$p_value_num[i]
+                p_value <- ifelse(abs(p_value_new - extracted_data$p_value_num[i]) < abs(p_value - extracted_data$p_value_num[i]), p_value_new, p_value)
+              }
+            } else {
+              if (substr(chi_squared_value, 1, 1) == "2") {
+                if (nchar(chi_squared_value) == 1) {
+                  chi_squared_value <- paste0(chi_squared_value, ".0")
+                }
+                chi_squared_value_new <- as.numeric(substr(chi_squared_value_new, 2, nchar(chi_squared_value_new)))
+                p_value_new <- pchisq(chi_squared_value_new, df_value, lower.tail = FALSE)
+                # select p_value_new or p_value according to which one minimizes difference to extracted_data$p_value_num[i]
+                p_value <- max(p_value_new, p_value)
+              }
+            }
+            extracted_data$p_value_calc[i] <- p_value
+            extracted_data$p_value_reporting[i] <- "calc_from_chi_squared"
+            next
+          }
+        }
+      }
+      if (grepl("g\\s*=\\s*(-?\\d*\\.?\\d+)\\s*(,\\s*SE\\s*=\\s*(-?\\d*\\.?\\d+))", test_report, ignore.case = TRUE)) {
+        reg_match <- "g\\s*=\\s*(-?\\d*\\.?\\d+)\\s*(,\\s*SE\\s*=\\s*(-?\\d*\\.?\\d+))"
+        matches <- regmatches(test_report, regexec(reg_match, test_report, ignore.case = TRUE))
+        gamma_value <- as.numeric(matches[[1]][2])
+        se_value <- as.numeric(matches[[1]][4])
+        z_value <- gamma_value / se_value
+        p_value <- 2 * pnorm(-abs(z_value))
+        p_value <- as.numeric(format(p_value, scientific = TRUE))
+        # check if first digit of t-value is a 2
+        if (!(is.na(extracted_data$p_value_num[i]))) {
+          if (substr(gamma_value, 1, 1) == "2") {
+            if (nchar(gamma_value) == 1) {
+              gamma_value <- paste0(gamma_value, ".0")
+            }
+            gamma_value_new <- as.numeric(substr(gamma_value, 2, nchar(gamma_value)))
+            z_value_new <- gamma_value_new / se_value
+            p_value_new <- 2 * pnorm(-abs(z_value_new))
+            # select p_value_new or p_value according to which one minimizes difference to extracted_data$p_value_num[i]
+            p_value <- ifelse(abs(p_value_new - extracted_data$p_value_num[i]) < abs(p_value - extracted_data$p_value_num[i]), p_value_new, p_value)
+          }
+        } else {
+          if (substr(gamma_value, 1, 1) == "2") {
+            if (nchar(gamma_value) == 1) {
+              gamma_value <- paste0(gamma_value, ".0")
+            }
+            gamma_value_new <- as.numeric(substr(gamma_value, 2, nchar(gamma_value)))
+            z_value_new <- gamma_value_new / se_value
+            p_value_new <- 2 * pnorm(-abs(z_value_new))
+            # select p_value_new or p_value according to which one minimizes difference to extracted_data$p_value_num[i]
+            p_value <- max(p_value_new, p_value)
+          }
+        }
+        extracted_data$p_value_calc[i] <- p_value
+        extracted_data$p_value_reporting[i] <- "calc_from_gamma"
+        next
+      }
+    }
+  }
+  return(extracted_data)
+}
+```
+
+# Example Use
+
+This is how you would pass a list of files to get a table containing all p-values and the corresponding test reports.
+
+```{r}
+path <- "path/to/xml_files"
+files_xml <- list.files(path, pattern = "*.xml", full.names = TRUE)
+
+extracted_data <- extract_tests(path, files_xml)
+
+# number of total papers
+length(unique(extracted_data$file))
+
+# total number of extracted entries
+nrow(extracted_data)
+
+# number of papers that do report any sort of result
+nrow(extracted_data)-sum(extracted_data$p_value == "no p-values found; paper might be qualitative?")
+
+#number of papers that do report p-values
+length(unique(extracted_data$file[which(!(extracted_data$p_value == "no p-values found; paper might be qualitative?"))]))
+
+# make indicator for which p-values to use
+for(i in 1:nrow(extracted_data)){
+  if(extracted_data$p_value[i] != "no p-values found; paper might be qualitative?" && !(grepl("false extraction", extracted_data$test_report[i], fixed = TRUE)) && !grepl("*", extracted_data$test_report[i], fixed = TRUE)){
+    extracted_data$use_p_val[i] <- TRUE
+  } else {
+    extracted_data$use_p_val[i] <- FALSE
+  }
+  if(!(is.na(extracted_data$p_value_num[i]))){
+    if(extracted_data$p_value_num[i] > 1){
+      extracted_data$use_p_val[i] <- FALSE
+    }
+  }
+}
+
+# number of invalid p-values
+sum(!extracted_data$use_p_val)-sum(extracted_data$p_value == "no p-values found; paper might be qualitative?")
+
+# number of used p-values
+sum(extracted_data$use_p_val)
+
+# number of exact p-values 
+sum(grepl("exact", extracted_data$p_value_reporting))
+```
+
+# Calculate Exact p-values from extracted data
+
+```{r}
+extracted_data <- calculate_exact_p(extracted_data)
+
+# number of calculated p-values
+sum(grepl("calc", extracted_data$p_value_reporting))
+
+#number of all usable p-values
+sum(grepl("calc", extracted_data$p_value_reporting)) + sum(grepl("exact", extracted_data$p_value_reporting))
+```

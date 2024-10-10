@@ -1,0 +1,157 @@
+---
+title: "Downloading PDF files from DOIs"
+author: "Julian Quandt"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output: 
+  html_document:
+    theme: cerulean
+    highlight: tango
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    self_contained: true
+    code_folding: hide
+    code_download: false
+---
+
+<div style="border: 1px solid #999; border-radius: 5px; padding: 20px; margin-top: 20px; background-color: #ffffe0;">
+  <h3 style="color: #0056b3; margin-top: 0;">There is no R-code in this document</h3>
+  This document is solely a manual for how to convert the pdf files to xml files using grobid. It does not involve any R-code. Therefore, downloading or inspecting the .Rmd version of this file does not really make sense, it was only used to produce this html manual.
+</div>
+
+```{r, include = FALSE}
+# set options to not knit code chunks
+knitr::opts_chunk$set(echo = TRUE, eval = FALSE, include = TRUE, warning = FALSE, message = FALSE)
+if (!require(kableExtra)) {
+  install.packages("kableExtra")
+  library(kableExtra)
+}
+```
+
+# Introduction to grobid
+
+[grobid](https://grobid.readthedocs.io/en/latest/) is a machine learning library for extracting text from pdfs and converting it to xml.
+While a pdf document often looks like a bunch of text, it is actually a collection of objects that are positioned on a page.
+Grobid uses machine learning to identify the different objects and their position on the page.
+It then extracts the text from the objects and converts it to xml.
+The xml files can then be used to extract the information that is contained in the pdfs.
+For us, this means that we can use the xml to extract p-values and other test statistics from the document. 
+
+Unfortunately, this process is more complicated than it sounds, which means that the setup of grobid is also a bit complicated.
+The following sections will guide you through the process of setting up grobid and using it to convert pdfs to xml files.
+
+# Installing grobid
+
+
+<div style="border: 1px solid #999; border-radius: 5px; padding: 20px; margin-top: 20px; background-color: #ffffe0;">
+  <h3 style="color: #0056b3; margin-top: 0;">Grobid Diskspace</h3>
+  Grobid requires a lot of diskspace. The docker image is about 18GB. To run the container, another 18GB are required. This means that you need at least 40GB of free diskspace to run grobid (as some additional space will be needed for the linux distributions that grobid is running on). 
+</div>
+
+
+## Installing docker
+
+The easiest way (which is still not really "easy") to install grobid is to use docker.
+Docker is a program that allows you to run programs in a virtual environment.
+As grobid does not run on windows computers, this is the only way for us to run it on windows.
+When installing docker, it will set up a virtual linux environment on your computer (or at least walk you through the process during installation).
+This virtual environment is then used to run grobid.
+
+To install docker, go to the [docker website](https://www.docker.com/products/docker-desktop) and download the installer for windows.
+Once the installer is downloaded, run it and follow the instructions. 
+When asked, select "Linux containers" or "WSL 2" and not "Windows containers". 
+You might need to activate some Windows features, which the installer will tell you about.
+Once docker is installed, you should see a little whale icon in your task bar.
+If there is no wale icon, you can start docker by starting the program "Docker Desktop" from the Windows start menu.
+If you click on it and the application started, you should see a screen like this (if you do not see this screen, select "Images on the upper right of the window"):
+
+![Docker Desktop](src/img/docker_startscreen.png)
+
+In the lower left corner, you should see a little green field, with a wale in it that says "Engine running".
+At this point, docker is running and we can proceed with installing grobid.
+
+## Installing grobid
+
+To install grobid, we first need to download the grobid docker image.
+Click on "Search Images to Run" in the middle of the screen and a new menu will open.
+In the search bar, type "grobid/grobid" and press enter.
+You should see a list of different grobid images.
+Select the one that says "grobid/grobid" (not grobid/grobid-crf) and click on "Pull".
+
+![Docker Desktop](src/img/docker_pull_grobid.png)
+
+This process might take a while, as the image is about 18GB in size.
+Once the image is downloaded, you should see it in the list of images.
+
+![Docker Desktop](src/img/docker_image_grobid.png)
+
+## Building our custom grobid image
+
+<div style="border: 1px solid #999; border-radius: 5px; padding: 20px; margin-top: 20px; background-color: #ffffe0;">
+  <h3 style="color: #0056b3; margin-top: 0;">File endings</h3>
+  When I talk about a file like "build_grobid.bat" you might not see the ".bat" ending. This is because windows hides file endings by default. To see the file endings, you need to go to the "View" tab in the file explorer (View/Show on Windows 11) and check the box next to "File name extensions".
+</div>
+
+
+The grobid image that we downloaded lacks some functionality that we need to easily work with it.
+Therefore, we need to build our own custom image, including some additional software.
+To do this, open the folder called "grobid_build" in the folder where you downloaded this document.
+
+
+<div style="border: 1px solid #999; border-radius: 5px; padding: 20px; margin-top: 20px; background-color: #ffffe0;">
+  <h3 style="color: #0056b3; margin-top: 0;">Building custom grobid</h3>
+  Please run the next steps on your local computer, not on the onedrive folder. 
+</div>
+
+Open the "docker_builder" folder and double click on build_grobid.bat
+The file will open a terminal window, running a script that will build our custom grobid image.
+After it is done, it will show "Press any key to continue . . .", and on pressing any key on the keyboard, the window will close. 
+
+Now, if you go back to the docker desktop, you should see a new image called "grobid_pcurve".
+
+![Docker Desktop](src/img/docker_custom_grobid.png)
+
+## Running grobid
+
+At this point, we have installed grobid and are ready to run it.
+To do this, click on the "run_grobid.bat" file in the "grobid_build" folder (do not use gpu_run_grobit.bat unless you have a powerful graphics card, otherwise it will be slower).
+This will open a terminal window, running a script that will start grobid.
+The first thing you will be asked to do is enter the "host path for the volume". 
+This is the folder on your computer where the PDF files that you want to convert are located.
+Importantly, the grobid machine will run on linux, which means that we need to enter the path in linux format.
+This means that we need to replace the backslashes in the path with forward slashes and remove the : in the drive letter.
+For example, if the folder is located at "C:\Users\MaxiMuster\Documents\grobid_test", we need to enter "/c/Users/MaxiMuster/Documents/grobid_test".
+
+After you did this, grobid will start up within our docker container and you will see the message "Waiting for Grobid service to start". 
+This might take a while, as the container needs to be started and grobid needs to be initialized.
+Once grobid is running, you will see the message "Grobid service is running" and be asked to "Enter the number of parallel processing threads".
+A default value based on your computer's processor will be suggested, and usually you can just press enter to accept it.
+Otherwise enter a lower number between 1 and the suggestion and press enter.
+
+Next you will be asked whether you want to run grobid recursively within this folder or not.
+Running grobid recursively means that each subfolder within the folder that you chose on startup will be processed and all the containing pdfs will be converted.
+If you want to run grobid on all the pdfs in the folder, enter "y" and press enter.
+If you only want to run grobid on the pdfs in the folder itself, enter "n" and press enter (see below).
+
+![Conversion Process](src/img/conversion.png)
+
+The process can take really long and will only occasionally provide updates on what it is doing (once per folder if run recursively). 
+Therefore, it might be wise to first try grobid on a test folder with few pdf files before running it on a large folder.
+
+After grobid is done, you will see that the terminal got interactive again (i.e. you can type something in it). 
+In your folder, you should now see the pdf files accompanied by a grobid.tei.xml file with the same name.
+At this point, the conversion is done and you can close the terminal window by entering "exit" and press enter.
+The docker container will shut down and disappear, and you need to restart it by double clicking on the "run_grobid.bat" file again (no need to run build_grobid.bat again).
+
+## Finishing up
+
+You can now copy the grobid.tei.xml files to the onedrive folder.
+Please copy the XML files only (i.e. not the pdfs) to the XMLs folder in the onedrive folder. 
+Use the same structure as in the PDFs folder, i.e. create a subfolder for each journal and put the xml files in there.
+
+
+## Troubleshooting
+
+If you run into problems with grobid, try to run docker with only 1 thread instead of the suggested default. 
+
+If you have a powerful graphics card in your computer, you can try running the gpu_run_grobit.bat file instead of the run_grobid.bat file.

@@ -1,0 +1,161 @@
+---
+title: "Fetching Publications by ISSN from Crossref"
+author: "Julian Quandt"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output: 
+  html_document:
+    theme: cerulean
+    highlight: tango
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    self_contained: true
+---
+
+
+
+# Fetching publications by ISSN
+
+Journals have ISSN numbers attached to them. 
+This number can be used to fetch all publications of a journal from Crossref.
+Together with specifying a time range, this can be used to fetch all publications of a journal in a given time range.
+
+The following function serves to do exactly that.
+
+First we define a few convenience functions that will be used later on.
+
+```{r}	
+# Install and load the rcrossref package if not already done
+if (!require(rcrossref)) {
+  install.packages("rcrossref")
+  library(rcrossref)
+}
+
+# Author names are stored within a tibble for each entry.
+# Therefore, author names must be extracted using this function.
+concatenate_authors <- function(authors_tibble) {
+  # Combine 'given' and 'family' to get full names for each author in the tibble
+  if(is.null(authors_tibble)) return(character(0))
+
+  full_names <- apply(authors_tibble, 1, function(row) {
+    paste(row['given'], row['family'])
+  })
+  
+  # Concatenate all names into a single string
+  return(paste(full_names, collapse = ", "))
+}
+
+# this is a small convenience function to retrieve the publication year from a publication entry that is formatted (yyyy-mm-dd)
+retrieve_pubyear <- function(publication) {
+  # Extract details from the publication tibble
+  year <- ifelse(!is.null(publication$`published.print`), substr(publication$`published.print`, 1, 4), "")
+  return(year)
+}
+
+# we want to generate APA-style citations for each publication
+# to achieve this, we need to extract the relevant information for each publication and format it accordingly
+generate_apa_citation <- function(publication) {
+    # Extract details from the publication tibble
+    title <- ifelse(length(publication$title) > 0, publication$title[[1]], "")
+    authors <- ifelse(!is.null(publication$author), concatenate_authors(publication$author), character(0))
+    doi <- ifelse(!is.null(publication$doi), publication$doi, "")
+    link <- ifelse(!is.null(publication$url), publication$url, "")
+    issue <- ifelse(!is.null(publication$issue), publication$issue, "")
+    year <- ifelse(!is.null(publication$`published.print`), retrieve_pubyear(publication), "")
+    journal <- ifelse(length(publication$`container.title`) > 0, publication$`container.title`, "")
+    volume <- ifelse(!is.null(publication$volume), gsub("\\(.*\\)", "", publication$volume), "")
+    pages <- ifelse(!is.null(publication$page), publication$page, "")
+
+    # format authors in APA style (last name, initials)
+    formattedAuthors <- sapply(unlist(strsplit(authors, ", ")), function(author) {
+        nameParts <- unlist(strsplit(author, " "))
+        lastName <- tail(nameParts, 1) # Last name
+        # For initials, consider all name parts except the last one (family name)
+        initials <- paste0(substr(nameParts[-length(nameParts)], 1, 1), collapse = ".")
+        return(paste(lastName, paste0(initials, "."), sep = ", "))
+    })
+
+    # Collapse the resulting vector to a single string
+    formattedAuthors <- paste(formattedAuthors, collapse = ", ")
+
+    # Create the APA reference
+    apaReference <- sprintf("%s (%s). %s. %s, %s(%s), %s. %s", formattedAuthors, year, title, journal, volume, issue, pages, doi)
+    return(apaReference)
+}
+```
+
+
+Now we can define the function that fetches all publications of a journal in a given time range.
+The function takes the following parameters:
+
+* the ISSN of the Journal (can be found by just google'in for it)
+* the start year of the time range to be fetched
+* the end year of the time range to be fetched
+* a cursor argument that is just set to "*" by default. This is used to fetch the next batch of publications. If you want to fetch all publications, you can just leave it at the default value.
+* a clean_unpublished argument that is set to FALSE by default. If set to TRUE, all publications that are not published yet (OR DO NOT HAVE A DATE IN THE ENTRY FOR OTHER REASONS) will be removed from the result set.
+
+
+```{r}
+fetchPublications <- function(journalISSN, startYear, endYear, cursor = "*", clean_unpublished = FALSE) {
+
+    # Make the request
+    res <- cr_journals(
+        issn = journalISSN,
+        filter = c(from_pub_date = startYear, until_pub_date = endYear), works = TRUE,
+        # works = TRUE means that we want to fetch the publications of the journal
+        cursor = cursor, 
+        # cursor = "*" means that we want to fetch the first batch of publications
+        .progress = TRUE
+        # .progress = TRUE means that we want to see a progress bar
+    )
+
+    # after finishing the initial fetching, we want to format the authors as a single string (they are stored in data-sets within each publication entry by default)
+    author_strings <- lapply(res$data$author, concatenate_authors)
+
+    # we also want to generate APA-style citations for each publication
+    apa_citations <- apply(res$data, 1, function(row) {
+        return(generate_apa_citation(row))
+    })
+    
+    # and we want to retrieve the publication year from the publication entry
+    years <- apply(res$data, 1, function(row) {
+        return(retrieve_pubyear(row))
+    })
+
+    # append the columns to the data frame
+    res$data$authors <- rep(NA)
+    res$data$authors <- author_strings
+    res$data$apa_citation <- rep(NA)
+    res$data$apa_citation <- apa_citations
+    res$data$year <- rep(NA)
+    res$data$year <- years
+
+    # for information purposes, print the number of publications that were fetched
+    
+    if(clean_unpublished) {
+        nrow_before <- nrow(res$data)
+        print("cleaned")
+        # remove all publications that are not published yet
+        res$data <- res$data[!is.na(res$data$year), ]
+        print(nrow(res$data[!is.na(res$data$year), ]))
+        print(nrow(res$data))
+        message(paste("Fetched", nrow(res$data), "publications.", nrow_before - nrow(res$data), "were deleted due to not being published yet."))
+    } else {
+        message(paste("Fetched", nrow(res$data), "publications."))
+    }
+
+    # return all publications
+    return(res$data)
+}
+```
+
+
+## Example
+
+Let's fetch all publications of the journal *Academy of Management Journal* from 2011 to 2023.
+
+```{r}
+publications <- fetchPublications('0001-4273', '2011', '2023', clean_unpublished = FALSE)
+publications_df <- data.frame(publications)
+```
+
